@@ -72,6 +72,7 @@ class SelectedScene:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.item_id,
             "item_id": self.item_id,
             "collection": self.collection,
             "bbox": self.bbox,
@@ -82,6 +83,12 @@ class SelectedScene:
             "provider": self.provider,
             "score": self.score,
             "overlap_ratio": self.overlap_ratio,
+            "assets": self.assets,
+            "properties": {
+                "datetime": self.datetime,
+                "eo:cloud_cover": self.cloud_cover,
+                "platform": self.platform,
+            },
         }
 
 

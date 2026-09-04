@@ -60,12 +60,14 @@ export default function ResultsPanel({ result }: ResultsPanelProps) {
         </div>
 
         {/* Confidence */}
-        <div className="mt-3 flex items-center gap-2">
-          <span className="text-[10px] text-oq-300">Confidence:</span>
-          <span className="text-[10px] text-lime font-medium">
-            {result.decision?.confidence || 'medium'}
-          </span>
-        </div>
+        {result.decision?.confidence && (
+          <div className="mt-3 flex items-center gap-2">
+            <span className="text-[10px] text-oq-300">Confidence:</span>
+            <span className="text-[10px] text-lime font-medium">
+              {result.decision.confidence}
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );

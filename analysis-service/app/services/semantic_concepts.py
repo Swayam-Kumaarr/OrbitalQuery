@@ -132,7 +132,7 @@ SEMANTIC_CONCEPTS: dict[str, SemanticConcept] = {
             SignalRule(
                 index_name="NDBI",
                 direction="increase",
-                threshold=0.10,
+                threshold=0.12,
                 is_primary=True,
                 label="Built-up increase",
             ),
@@ -164,7 +164,7 @@ SEMANTIC_CONCEPTS: dict[str, SemanticConcept] = {
                 interpretation="Spatially coherent changes are more likely real than noise",
             ),
         ],
-        min_agreeing_signals=1,
+        min_agreeing_signals=2,  # BOTH NDBI increase AND NDVI decrease required
         multi_signal_recommended=True,
         keywords=["urban", "built-up", "built up", "construction", "expansion", "urbanization", "urbanisation", "city growth", "infrastructure", "settlement", "impervious"],
         layer="URBAN EXPANSION",

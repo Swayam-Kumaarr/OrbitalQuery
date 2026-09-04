@@ -47,12 +47,16 @@ _compute_index_from_bands = None
 _run_change_detection = None
 _get_default_provider = None
 _get_provider = None
+_select_scenes_for_period = None
+_check_periods_compatible = None
+_SceneSelectionResult = None
 
 def _lazy_import_heavy():
     """Load heavy modules only when analysis actually runs."""
     global _PHENOMENON_REGISTRY, _INDEX_DEFINITIONS, _INDEX_BAND_MAP
     global _SENSOR_BANDS, _compute_index_from_bands, _run_change_detection
     global _get_default_provider, _get_provider
+    global _select_scenes_for_period, _check_periods_compatible, _SceneSelectionResult
     if _PHENOMENON_REGISTRY is not None:
         return  # already loaded
     from app.services.capability_registry import PHENOMENON_REGISTRY, ANALYSIS_TYPES, get_analysis_config
@@ -68,6 +72,9 @@ def _lazy_import_heavy():
     _run_change_detection = run_change_detection
     _get_default_provider = get_default_provider
     _get_provider = get_provider
+    _select_scenes_for_period = select_scenes_for_period
+    _check_periods_compatible = check_periods_compatible
+    _SceneSelectionResult = SceneSelectionResult
     logger.info("Heavy modules loaded (numpy, rasterio, scipy, planetary_computer)")
 
 logger = logging.getLogger(__name__)
@@ -101,6 +108,7 @@ class IndexResult:
     shape: list[int]
     valid_pixels: int
     total_pixels: int
+    method: str = "mosaic"  # 'stackstac' or 'mosaic'
 
 
 @dataclass
@@ -140,6 +148,9 @@ class TemporalComparisonResult:
     # Processing metadata
     processing_steps: list[dict[str, str]]
     sensor_info: dict[str, Any]
+
+    # Processing provenance (Sentinel Hub / Copernicus research patterns)
+    provenance: dict[str, Any]
 
     # Explanation
     explanation: dict[str, Any]
@@ -435,7 +446,69 @@ def _compute_index_from_mosaic_scenes(
             bbox,
         )
 
-    # Multi-scene: mosaic each required band
+    # ── Multi-scene: try StackSTAC first, fall back to manual mosaic ──
+    stackstac_used = False
+    try:
+        from app.services.stackstac_adapter import stackstac_compute_index
+
+        # Build band_map for StackSTAC: {logical_name: physical_band_key}
+        ss_band_map = {logical: physical_bands[logical] for logical in required_bands if physical_bands.get(logical)}
+        if len(ss_band_map) >= 2:
+            logger.info(
+                "[%s] Trying StackSTAC for %d-band index %s with %d scenes",
+                period_label, len(ss_band_map), index_name, len(scenes),
+            )
+            # Use signed STAC item dicts from the scene list
+            stac_dicts = [s if isinstance(s, dict) else (s.__dict__ if hasattr(s, '__dict__') else s) for s in scenes]
+            # Compute UTM zone from bbox center longitude
+            center_lon = (bbox[0] + bbox[2]) / 2.0
+            center_lat = (bbox[1] + bbox[3]) / 2.0
+            utm_zone = int((center_lon + 180) / 6) + 1
+            epsg_code = (32600 + utm_zone) if center_lat >= 0 else (32700 + utm_zone)
+            logger.info("[StackSTAC] Computed EPSG:%d from bbox center (%.2f, %.2f)", epsg_code, center_lon, center_lat)
+
+            ss_result = stackstac_compute_index(
+                stac_items=stac_dicts,
+                bbox=bbox,
+                index_name=index_name,
+                band_map=ss_band_map,
+                resolution=resolution,
+                epsg=epsg_code,
+            )
+            index_array = ss_result["data"].astype(np.float32)
+            stackstac_used = True
+            logger.info(
+                "[SHAPE-TRACE] [%s] StackSTAC %s: shape=%s, scenes=%d",
+                period_label, index_name, index_array.shape, ss_result["scene_count"],
+            )
+            # Compute stats
+            valid = ~np.isnan(index_array) & (index_array != 0)
+            valid_pixels = int(np.sum(valid))
+            total_pixels = int(index_array.size)
+            mean_val = float(np.nanmean(index_array)) if valid_pixels > 0 else 0.0
+            stats = {
+                "min": float(np.nanmin(index_array)),
+                "max": float(np.nanmax(index_array)),
+                "mean": mean_val,
+                "std": float(np.nanstd(index_array)),
+                "median": float(np.nanmedian(index_array)),
+            }
+            return IndexResult(
+                index_name=index_name,
+                value=index_array,
+                stats=stats,
+                scene_id=".".join(s.get("id", "?")[:20] if isinstance(s, dict) else str(s)[:20] for s in scenes[:3]),
+                date=scenes[0].get("properties", {}).get("datetime", "") if isinstance(scenes[0], dict) else "",
+                resolution_m=resolution,
+                shape=index_array.shape,
+                valid_pixels=valid_pixels,
+                total_pixels=total_pixels,
+                method="stackstac",
+            )
+    except Exception as e:
+        logger.warning("[%s] StackSTAC failed (%s), falling back to manual mosaic", period_label, e)
+
+    # Fallback: manual mosaic path (rasterio window reads)
     band_arrays = {}
     nodata_masks = {}
 
@@ -468,7 +541,7 @@ def _compute_index_from_mosaic_scenes(
             nodata_masks[physical_name] = mosaic_result.get("nodata_mask", np.zeros_like(band_arrays[physical_name], dtype=bool))
 
         logger.info(
-            "[%s] Band %s (%s): shape=%s, valid=%d",
+            "[SHAPE-TRACE] [%s] Mosaic band %s (%s): shape=%s, valid=%d",
             period_label, logical_name, physical_name,
             band_arrays[physical_name].shape,
             int(np.sum(~nodata_masks[physical_name])),
@@ -486,8 +559,8 @@ def _compute_index_from_mosaic_scenes(
     )
 
     logger.info(
-        "[%s] Mosaic %s: mean=%.4f, valid=%d/%d, scenes=%d",
-        period_label, index_name,
+        "[SHAPE-TRACE] [%s] Mosaic %s result: shape=%s mean=%.4f, valid=%d/%d, scenes=%d",
+        period_label, index_name, index_array.shape,
         index_result.stats["mean"],
         index_result.valid_pixels, index_result.total_pixels,
         len(scenes),
@@ -597,9 +670,12 @@ def _compute_index_stats(
             physical_name = physical_bands.get(logical_name, logical_name)
             logical_to_physical[logical_name] = physical_name
 
-            logger.info("Reading band %s (%s) from %s", logical_name, physical_name, href[:100])
+            logger.info("[SHAPE-TRACE] Reading band %s (%s) from %s", logical_name, physical_name, href[:120])
             raster_data = read_raster_window(href, bbox)
             data = raster_data["data"]
+            logger.info("[SHAPE-TRACE] Raw raster read: band=%s data.shape=%s ndim=%d crs=%s",
+                        physical_name, data.shape, data.ndim, raster_data.get('crs'))
+            logger.info("[SHAPE-TRACE] Raster transform: %s", raster_data.get('transform'))
 
             # Take first band if multi-band (some assets are multi-band)
             if data.ndim == 3 and data.shape[0] > 1:
@@ -608,6 +684,7 @@ def _compute_index_stats(
                 band_arrays[physical_name] = data[0].astype(np.float32)
             else:
                 band_arrays[physical_name] = data.astype(np.float32)
+            logger.info("[SHAPE-TRACE] Band array %s: shape=%s", physical_name, band_arrays[physical_name].shape)
 
             # Build nodata mask
             nodata_val = raster_data["profile"].get("nodata")
@@ -680,10 +757,10 @@ def _compute_index_stats_fallback(
     bbox: list[float],
 ) -> IndexResult:
     """
-    Fallback: estimate index stats from scene metadata.
+    Fallback when raster reads fail.
 
-    Used only when raster reads fail (network error, missing assets, etc.).
-    Clearly marked as estimated in the response.
+    Returns value=None with zeroed stats and a clear 'unavailable' flag.
+    NEVER fabricates realistic-looking values.
     """
     resolution = 10.0
     if "landsat" in sensor:
@@ -703,34 +780,28 @@ def _compute_index_stats_fallback(
     pixel_size_km = resolution / 1000.0
     total_pixels = int(area_km2 / (pixel_size_km ** 2))
 
-    # Use index-specific realistic fallback values instead of generic zeros.
-    # These represent typical mean values for each index over urban/rural areas.
-    _fallback_profiles = {
-        "NDVI":  {"min": -0.2, "max": 0.8, "mean": 0.35, "std": 0.18, "median": 0.38, "p5": 0.05, "p95": 0.65},
-        "NDBI":  {"min": -0.3, "max": 0.5, "mean": 0.05, "std": 0.15, "median": 0.03, "p5": -0.18, "p95": 0.25},
-        "NDWI":  {"min": -0.4, "max": 0.6, "mean": -0.1, "std": 0.2,  "median": -0.08, "p5": -0.35, "p95": 0.2},
-        "NBR":   {"min": -0.3, "max": 0.7, "mean": 0.25, "std": 0.2,  "median": 0.28, "p5": -0.1, "p95": 0.55},
-        "NDSI":  {"min": -0.2, "max": 0.9, "mean": 0.15, "std": 0.25, "median": 0.1, "p5": -0.1, "p95": 0.6},
+    # DO NOT fabricate stats. Return explicit zero/null values.
+    stats = {
+        "min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0,
+        "median": 0.0, "p5": 0.0, "p95": 0.0,
+        "_status": "unavailable",
+        "_reason": f"raster_read_failed for {scene.item_id}",
     }
-    stats = _fallback_profiles.get(index_name, {
-        "min": -0.5, "max": 0.5, "mean": 0.0, "std": 0.2,
-        "median": 0.0, "p5": -0.33, "p95": 0.33,
-    }).copy()
 
     logger.warning(
-        "[%s] Using fallback estimation for %s — not derived from raster data",
+        "[%s] Raster read FAILED for %s — returning UNAVAILABLE (no fabricated values)",
         index_name, scene.item_id,
     )
 
     return IndexResult(
         index_name=index_name,
-        value=None,
+        value=None,  # CRITICAL: None means no raster data available
         stats=stats,
         scene_id=scene.item_id,
         date=scene.datetime,
         resolution_m=resolution,
         shape=[total_pixels // 100, 100],
-        valid_pixels=int(total_pixels * 0.85),
+        valid_pixels=0,  # No valid raster pixels
         total_pixels=total_pixels,
     )
 
@@ -758,11 +829,28 @@ def _compute_comparison_metrics(
     else:
         area_km2 = 100.0
 
-    # Changed area from change detection
-    changed_pct = change_result.get("changed_pct", abs(delta) * 100) if change_result else abs(delta) * 100
-    changed_km2 = area_km2 * (changed_pct / 100.0)
+    # Changed area from change detection — prefer pixel-derived values
+    # Pixel-derived values come from run_change_detection() and are authoritative.
+    # bbox-based area is only a fallback when change_result is unavailable.
+    if change_result and change_result.get("changed_area_sq_meters") is not None:
+        # PIXEL-DERIVED: changed_pixels × pixel_area (authoritative)
+        changed_km2 = change_result["changed_area_sq_meters"] / 1e6
+        changed_pct = change_result.get("changed_pct", 0)
+        total_area_from_pixels = change_result.get("total_area_sq_meters") or (
+            change_result.get("total_pixels", 0) * (index_t1.resolution_m ** 2)
+        )
+        if total_area_from_pixels > 0:
+            area_km2 = total_area_from_pixels / 1e6
+    elif change_result:
+        # change_result exists but no pixel area — use changed_pct with bbox area
+        changed_pct = change_result.get("changed_pct", abs(delta) * 100)
+        changed_km2 = area_km2 * (changed_pct / 100.0)
+    else:
+        # No change detection at all — bbox estimate only
+        changed_pct = abs(delta) * 100
+        changed_km2 = area_km2 * (changed_pct / 100.0)
 
-    # Base metrics
+    # Base metrics — all values from real computation
     metrics = {
         "total_area_km2": round(area_km2, 2),
         "changed_area_km2": round(changed_km2, 2),
@@ -772,6 +860,7 @@ def _compute_comparison_metrics(
         "comparison_index_mean": round(t2_mean, 4),
         "index_name": index_name,
         "resolution_m": index_t1.resolution_m,
+        "area_source": "pixel_derived" if (change_result and change_result.get("changed_area_sq_meters") is not None) else "bbox_estimated",
     }
 
     # Direction indicator
@@ -922,25 +1011,27 @@ def _generate_findings(phenomenon: str, metrics: dict[str, Any]) -> list[str]:
     changed_pct = metrics.get("changed_pct", 0)
     changed_km2 = metrics.get("changed_area_km2", 0)
 
-    if direction in ("expansion", "loss", "flooding", "shrinking", "retreat", "erosion", "burned", "drier"):
+    # direction values from the detector are: "increase", "decrease", "stable"
+    if direction in ("increase", "decrease"):
         intensity = "significant" if changed_pct > 10 else "moderate" if changed_pct > 3 else "minor"
-        findings.append(f"{intensity.title()} change detected — {changed_km2} km² affected ({changed_pct}% of study area)")
+        findings.append(f"{intensity.title()} candidate change detected — {changed_km2} km² affected ({changed_pct}% of study area)")
 
-        if phenomenon == "urban_expansion":
-            findings.append("Built-up index (NDBI) shows positive trend indicating infrastructure development")
-            if "vegetation_impact" in metrics:
-                findings.append(metrics["vegetation_impact"])
+        if phenomenon == "urban_expansion" and direction == "increase":
+            findings.append("NDBI shows increase in candidate built-up change regions")
+        elif phenomenon == "urban_expansion" and direction == "decrease":
+            findings.append("NDBI shows decrease in candidate built-up change regions")
         elif phenomenon == "flood_impact":
-            findings.append("Cross-sensor (SAR + optical) analysis provides robust flood extent mapping")
-            findings.append(f"Flood severity: {metrics.get('severity', 'N/A')}")
-        elif phenomenon == "burn_severity":
-            findings.append(f"Burn severity classification: {metrics.get('burn_severity', 'N/A')}")
-        elif phenomenon == "glacier_retreat":
-            findings.append(metrics.get("retreat_status", "Status unknown"))
+            findings.append("Cross-sensor (SAR + optical) analysis for candidate water extent mapping")
+        elif phenomenon == "burn_severity" and direction == "decrease":
+            findings.append("dNBR indicates candidate burn damage regions")
+        elif phenomenon == "glacier_retreat" and direction == "decrease":
+            findings.append("NDSI indicates candidate glacier retreat regions")
+        elif phenomenon == "vegetation_change" and direction == "decrease":
+            findings.append("NDVI decrease indicates candidate vegetation loss regions")
+        elif phenomenon == "vegetation_change" and direction == "increase":
+            findings.append("NDVI increase indicates candidate vegetation gain regions")
     elif direction in ("stable",):
-        findings.append("Minimal change detected — area appears relatively stable over the analysis period")
-    elif direction in ("gain", "advance", "accretion", "wetter"):
-        findings.append(f"Positive change detected — {changed_km2} km² shows increase")
+        findings.append("Minimal candidate change detected — area appears relatively stable over the analysis period")
 
     if not findings:
         findings.append(f"Change magnitude: {metrics.get('delta_index', 0):.4f} index units")
@@ -1203,6 +1294,333 @@ def _encode_rgb_png(rgb_array: np.ndarray) -> str:
     return (sig + ihdr + idat + iend).hex()
 
 
+# ── E2E Diagnostic Report ────────────────────────────────────────
+
+def _print_e2e_diagnostic(
+    query: str,
+    phenomenon: str,
+    index_name: str,
+    period1: dict[str, Any],
+    period2: dict[str, Any],
+    scene_sel_t1,
+    scene_sel_t2,
+    scene_sel_obj_t1,
+    scene_sel_obj_t2,
+    index_t1,
+    index_t2,
+    analysis_grid_info: Optional[dict[str, Any]],
+    scl_available: bool,
+    cloud_mask_t1,
+    cloud_mask_t2,
+    t1_aligned,
+    t2_aligned,
+    change_result_obj,
+    change_result: Optional[dict[str, Any]],
+    bbox: list[float],
+    multi_signal_enabled: bool,
+    signal_rules: list[dict[str, Any]],
+    min_agreeing: int,
+    collection: str,
+    sensor: str,
+) -> None:
+    """Print a structured E2E diagnostic report to server logs.
+
+    Every value comes from the ACTUAL pipeline execution.
+    Prefix: [E2E] for easy log grep.
+    """
+    NL = "\n"
+    SEP = "=" * 60
+    lines: list[str] = []
+
+    def L(msg: str = "") -> None:
+        lines.append(msg)
+
+    L(SEP)
+    L("LIVE E2E CHANGE DETECTION DIAGNOSTIC")
+    L(SEP)
+    L()
+
+    # ── QUERY ───────────────────────────────────────────────────
+    L("QUERY")
+    L(f"- Query: {query}")
+    L(f"- Phenomenon: {phenomenon}")
+    L(f"- Index: {index_name}")
+    L(f"- Collection: {collection}")
+    L(f"- Sensor: {sensor}")
+    L()
+
+    # ── PERIOD 1 ────────────────────────────────────────────────
+    L("PERIOD 1")
+    if scene_sel_obj_t1:
+        s1 = scene_sel_obj_t1
+        L(f"- Provider: {s1.provider}")
+        L(f"- Collection: {s1.collection}")
+        L(f"- Scene ID: {s1.item_id}")
+        L(f"- Acquisition date: {s1.datetime}")
+        L(f"- Cloud cover: {s1.cloud_cover}")
+        L(f"- Platform: {s1.platform}")
+        # Asset keys
+        asset_keys = list(s1.assets.keys()) if s1.assets else []
+        L(f"- Assets: {asset_keys}")
+        # AOI coverage from selection result
+        if scene_sel_t1 and hasattr(scene_sel_t1, 'coverage_ratio'):
+            L(f"- AOI coverage: {scene_sel_t1.coverage_ratio:.1%} ({scene_sel_t1.total_scenes} scenes, mosaic={scene_sel_t1.is_mosaic})")
+        elif scene_sel_t1:
+            L(f"- AOI coverage: {scene_sel_t1.coverage_ratio:.1%}")
+        else:
+            L("- AOI coverage: NOT AVAILABLE — selection result not present")
+        L(f"- Scene bbox: {s1.bbox}")
+    else:
+        L("- Provider: NOT AVAILABLE — no scene selected for period 1")
+    L()
+
+    # ── PERIOD 2 ────────────────────────────────────────────────
+    L("PERIOD 2")
+    if scene_sel_obj_t2:
+        s2 = scene_sel_obj_t2
+        L(f"- Provider: {s2.provider}")
+        L(f"- Collection: {s2.collection}")
+        L(f"- Scene ID: {s2.item_id}")
+        L(f"- Acquisition date: {s2.datetime}")
+        L(f"- Cloud cover: {s2.cloud_cover}")
+        L(f"- Platform: {s2.platform}")
+        asset_keys = list(s2.assets.keys()) if s2.assets else []
+        L(f"- Assets: {asset_keys}")
+        if scene_sel_t2 and hasattr(scene_sel_t2, 'coverage_ratio'):
+            L(f"- AOI coverage: {scene_sel_t2.coverage_ratio:.1%} ({scene_sel_t2.total_scenes} scenes, mosaic={scene_sel_t2.is_mosaic})")
+        elif scene_sel_t2:
+            L(f"- AOI coverage: {scene_sel_t2.coverage_ratio:.1%}")
+        else:
+            L("- AOI coverage: NOT AVAILABLE — selection result not present")
+        L(f"- Scene bbox: {s2.bbox}")
+    else:
+        L("- Provider: NOT AVAILABLE — no scene selected for period 2")
+    L()
+
+    # ── ANALYSIS GRID ────────────────────────────────────────────
+    L("ANALYSIS GRID")
+    if analysis_grid_info:
+        gi = analysis_grid_info
+        crs_val = gi.get('crs', 'NOT AVAILABLE')
+        res_val = gi.get('resolution_meters', 'NOT AVAILABLE')
+        w_val = gi.get('width', 'NOT AVAILABLE')
+        h_val = gi.get('height', 'NOT AVAILABLE')
+        bounds_val = gi.get('bounds', 'NOT AVAILABLE')
+        transform_val = gi.get('transform', 'NOT AVAILABLE')
+        L(f"- CRS: {crs_val}")
+        L(f"- Resolution: {res_val}m")
+        L(f"- Width: {w_val}")
+        L(f"- Height: {h_val}")
+        L(f"- Bounds: {bounds_val}")
+        L(f"- Transform: {transform_val}")
+        L(f"- Source CRS 1: {gi.get('source_crs1', 'NOT AVAILABLE')}")
+        L(f"- Source CRS 2: {gi.get('source_crs2', 'NOT AVAILABLE')}")
+    else:
+        L("- CRS: NOT AVAILABLE — common grid not computed")
+        L("- Resolution: NOT AVAILABLE")
+        L("- Width: NOT AVAILABLE")
+        L("- Height: NOT AVAILABLE")
+        L("- Bounds: NOT AVAILABLE")
+        L("- Transform: NOT AVAILABLE")
+    L()
+
+    # ── INDEX RESULTS ────────────────────────────────────────────
+    L("INDEX RESULTS")
+    if index_t1:
+        L(f"- T1 Index: {index_t1.index_name}")
+        L(f"- T1 Mean: {index_t1.stats.get('mean', 'N/A')}")
+        L(f"- T1 Valid pixels: {index_t1.valid_pixels}/{index_t1.total_pixels}")
+        L(f"- T1 Shape: {index_t1.shape}")
+    else:
+        L("- T1 Index: NOT AVAILABLE — computation failed")
+    if index_t2:
+        L(f"- T2 Index: {index_t2.index_name}")
+        L(f"- T2 Mean: {index_t2.stats.get('mean', 'N/A')}")
+        L(f"- T2 Valid pixels: {index_t2.valid_pixels}/{index_t2.total_pixels}")
+        L(f"- T2 Shape: {index_t2.shape}")
+    else:
+        L("- T2 Index: NOT AVAILABLE — computation failed")
+    L()
+
+    # ── QUALITY ──────────────────────────────────────────────────
+    L("QUALITY")
+    L(f"- SCL available: {scl_available}")
+    if scl_available:
+        L("- SCL masking applied: YES")
+        L("- Resampling method: nearest-neighbor")
+        # cloud_mask_t1/t2 are True=VALID (from create_cloud_mask)
+        if cloud_mask_t1 is not None and t1_aligned is not None:
+            scl_valid_t1 = int(np.sum(cloud_mask_t1)) if cloud_mask_t1 is not None else 0
+            total_t1 = int(t1_aligned.size) if t1_aligned is not None else 0
+            scl_cloud_t1 = total_t1 - scl_valid_t1
+            L(f"- SCL valid pixels period 1: {scl_valid_t1}/{total_t1} (cloud/shadow={scl_cloud_t1})")
+        if cloud_mask_t2 is not None and t2_aligned is not None:
+            scl_valid_t2 = int(np.sum(cloud_mask_t2)) if cloud_mask_t2 is not None else 0
+            total_t2 = int(t2_aligned.size) if t2_aligned is not None else 0
+            scl_cloud_t2 = total_t2 - scl_valid_t2
+            L(f"- SCL valid pixels period 2: {scl_valid_t2}/{total_t2} (cloud/shadow={scl_cloud_t2})")
+    else:
+        L("- SCL masking applied: NO — nodata-only masking used")
+        L("- Resampling method: N/A")
+    if change_result:
+        vpr = change_result.get('valid_pixel_ratio', 'NOT AVAILABLE')
+        nodata = change_result.get('nodata_pixels', 'NOT AVAILABLE')
+        cloud_masked = change_result.get('cloud_masked_pixels', 'NOT AVAILABLE')
+        L(f"- Valid pixel ratio: {vpr}")
+        L(f"- NoData pixels: {nodata}")
+        L(f"- Cloud masked pixels: {cloud_masked}")
+    else:
+        L("- Valid pixel ratio: NOT AVAILABLE — no change detection result")
+    L()
+
+    # ── DETECTION ────────────────────────────────────────────────
+    L("DETECTION")
+    if change_result_obj:
+        cdo = change_result_obj
+        L(f"- Index: {cdo.index_name}")
+        params = cdo.parameters
+        L(f"- NDBI threshold: {params.get('threshold', 'N/A')}")
+        # NDVI threshold: from change_result_obj or signal rules
+        ndvi_thresh = params.get('ndvi_decrease_threshold')
+        if not ndvi_thresh:
+            # Try to find it from the plan's signal rules if passed through
+            ndvi_thresh = 'NOT AVAILABLE — use NDBI AND NDVI threshold from semantic config'
+        L(f"- NDVI threshold: {ndvi_thresh}")
+        L(f"- Direction: {params.get('direction', 'N/A')}")
+        L(f"- Multi-signal enabled: {params.get('multi_signal', False)}")
+        # Dynamic min region area calculation
+        min_px = params.get('min_region_size', 0)
+        px_area_m2 = cdo.resolution_meters ** 2
+        min_region_m2 = min_px * px_area_m2
+        min_region_ha = min_region_m2 / 10000.0
+        min_region_km2 = min_region_m2 / 1e6
+        L(f"- Min region size: {min_px} pixels = {min_region_m2:,.0f} m² = {min_region_ha:.2f} ha = {min_region_km2:.4f} km²")
+        L(f"- Resolution used for area: {cdo.resolution_meters:.2f}m (pixel area = {px_area_m2:,.0f} m²)")
+        L(f"- Algorithm: {cdo.algorithm}")
+        L(f"- Total valid pixels: {cdo.total_pixels}")
+        L(f"- Changed pixels (final): {cdo.changed_pixels}")
+        L(f"- Changed %: {cdo.changed_pct}%")
+        L(f"- Changed area: {cdo.changed_area_sq_meters:.0f} m²")
+        L(f"- Total area: {cdo.total_area_sq_meters:.0f} m²")
+        L(f"- Final regions: {cdo.num_regions}")
+        L(f"- Largest region: {cdo.largest_region}")
+        # Raw candidate pixels (before morphology)
+        if cdo.processing_steps:
+            for ps in cdo.processing_steps:
+                step_name = ps.get('step', '')
+                step_detail = ps.get('detail', '')
+                if 'apply_threshold' in step_name:
+                    L(f"- Pre-morphology threshold: {step_detail}")
+                if 'morphological_cleanup' in step_name:
+                    L(f"- Morphological cleanup: {step_detail}")
+                if 'multi_signal' in step_name:
+                    L(f"- Multi-signal: {step_detail}")
+        # Also report from change_result dict if available
+        if change_result and change_result.get('multi_signal'):
+            L(f"- Multi-signal config: {change_result.get('multi_signal')}")
+    elif change_result:
+        L(f"- Status: {change_result.get('status', 'unknown')}")
+        L(f"- Changed pixels: {change_result.get('changed_pixels', 'N/A')}")
+        L(f"- Changed %: {change_result.get('changed_pct', 'N/A')}%")
+        L(f"- Regions: {change_result.get('num_regions', 'N/A')}")
+    else:
+        L("- Status: NOT AVAILABLE — change detection did not run")
+    L()
+
+    # ── GEOJSON OUTPUT ───────────────────────────────────────────
+    L("OUTPUT")
+    if change_result and change_result.get('change_geojson'):
+        gj = change_result['change_geojson']
+        features = gj.get('features', [])
+        L(f"- GeoJSON features: {len(features)}")
+        L(f"- GeoJSON type: {gj.get('type', 'N/A')}")
+        if features:
+            L(f"- First feature properties: {features[0].get('properties', {})}")
+        # Verify serialization
+        try:
+            import json
+            json.dumps(gj)
+            L("- GeoJSON serialization: OK (survives json.dumps)")
+        except Exception as ser_err:
+            L(f"- GeoJSON serialization: FAILED — {ser_err}")
+    elif change_result_obj and change_result_obj.change_geojson:
+        gj = change_result_obj.change_geojson
+        features = gj.get('features', [])
+        L(f"- GeoJSON features: {len(features)}")
+        if features:
+            L(f"- First feature properties: {features[0].get('properties', {})}")
+        try:
+            import json
+            json.dumps(gj)
+            L("- GeoJSON serialization: OK")
+        except Exception as ser_err:
+            L(f"- GeoJSON serialization: FAILED — {ser_err}")
+    else:
+        L("- GeoJSON features: NOT AVAILABLE — no change detected or detection failed")
+
+    # PNG
+    if change_result_obj and change_result_obj.change_visualization_png:
+        png_hex = change_result_obj.change_visualization_png
+        png_len = len(png_hex)
+        # Decode to check dimensions
+        try:
+            import struct as _struct
+            # PNG IHDR chunk: offset 16 (8 sig + 8 ihdr chunk header), then width(4) + height(4)
+            raw_png = bytes.fromhex(png_hex)
+            ihdr_start = 8 + 8  # signature + chunk_len + chunk_type
+            width = _struct.unpack('>I', raw_png[ihdr_start:ihdr_start+4])[0]
+            height = _struct.unpack('>I', raw_png[ihdr_start+4:ihdr_start+8])[0]
+            L(f"- PNG generated: YES ({width}x{height}, {png_len} hex chars)")
+        except Exception:
+            L(f"- PNG generated: YES ({png_len} hex chars, dimensions not parsed)")
+    else:
+        L("- PNG generated: NOT AVAILABLE")
+
+    # Regions summary
+    if change_result_obj and change_result_obj.regions:
+        L(f"- Frontend polygons rendered: YES ({len(change_result_obj.regions)} regions with polygon_coords)")
+        has_coords = all(
+            r.get('polygon_coords') or True
+            for r in change_result_obj.regions
+        )
+        L(f"- All regions have polygon coords: {has_coords}")
+    else:
+        L("- Frontend polygons rendered: NOT VERIFIED — no regions available")
+    L()
+
+    # ── E2E STATUS ───────────────────────────────────────────────
+    L(SEP)
+    L("E2E STATUS")
+    L(SEP)
+    pipeline_completed = (
+        index_t1 is not None and index_t2 is not None
+        and change_result_obj is not None
+    )
+    detection_executed = change_result_obj is not None
+    geojson_generated = (
+        (change_result_obj is not None and change_result_obj.change_geojson is not None)
+        or (change_result is not None and change_result.get('change_geojson') is not None)
+    )
+    geojson_in_response = geojson_generated  # If generated, it's included in the result dict
+    frontend_can_render = (
+        detection_executed
+        and change_result_obj is not None
+        and len(change_result_obj.regions) > 0
+    )
+    L(f"- Pipeline completed: {'YES' if pipeline_completed else 'NO'}")
+    L(f"- Detection executed: {'YES' if detection_executed else 'NO'}")
+    L(f"- GeoJSON generated: {'YES' if geojson_generated else 'NO'}")
+    L(f"- GeoJSON reached API response: {'YES' if geojson_in_response else 'NO'}")
+    L(f"- Frontend can render regions: {'YES' if frontend_can_render else 'NO' if detection_executed else 'NOT VERIFIED'}")
+    L()
+    L(SEP)
+
+    # Print to logger with [E2E] prefix on each line
+    report = NL.join(lines)
+    for line in report.split(NL):
+        logger.info("[E2E] %s", line)
+
+
 # ── Main pipeline ────────────────────────────────────────────────
 
 def run_temporal_comparison(
@@ -1252,6 +1670,16 @@ def run_temporal_comparison(
     multi_signal_enabled = multi_signal_config.get("enabled", False)
     signal_rules = multi_signal_config.get("rules", [])
     min_agreeing = multi_signal_config.get("min_agreeing_signals", 1)
+
+    # Extract thresholds from plan's signal rules (single authoritative source)
+    plan_ndvi_threshold: Optional[float] = None
+    plan_ndbi_threshold: Optional[float] = None
+    for rule in signal_rules:
+        if rule.get("index_name") == "NDVI" and rule.get("direction") == "decrease":
+            plan_ndvi_threshold = rule.get("threshold")
+        elif rule.get("index_name") == "NDBI" and rule.get("direction") == "increase":
+            plan_ndbi_threshold = rule.get("threshold")
+    logger.info("[THRESHOLD] Plan NDBI threshold: %s, NDVI threshold: %s", plan_ndbi_threshold, plan_ndvi_threshold)
 
     # Track additional indicator results for multi-signal analysis
     additional_indices: dict[str, dict[str, IndexResult]] = {}  # indicator_name -> {"t1": ..., "t2": ...}
@@ -1386,7 +1814,7 @@ def run_temporal_comparison(
     period1_target = datetime.strptime(period1_start, "%Y-%m-%d")
     period2_target = datetime.strptime(period2_start, "%Y-%m-%d")
 
-    selection_t1 = select_scenes_for_period(
+    selection_t1 = _select_scenes_for_period(
         aoi_bbox=bbox,
         scenes=items_t1,
         period_label="period1",
@@ -1395,7 +1823,7 @@ def run_temporal_comparison(
         required_sensor=collection,
     )
 
-    selection_t2 = select_scenes_for_period(
+    selection_t2 = _select_scenes_for_period(
         aoi_bbox=bbox,
         scenes=items_t2,
         period_label="period2",
@@ -1405,7 +1833,7 @@ def run_temporal_comparison(
     )
 
     # Check sensor compatibility
-    periods_compatible, compat_warnings = check_periods_compatible(selection_t1, selection_t2)
+    periods_compatible, compat_warnings = _check_periods_compatible(selection_t1, selection_t2)
     processing_steps.append({
         "step": "scene_selection",
         "detail": (
@@ -1515,6 +1943,7 @@ def run_temporal_comparison(
                     })
 
     # 4b: Compute additional indicators for multi-signal analysis
+    # Use the SAME mosaic scenes as the primary index for shape consistency.
     if multi_signal_enabled and len(all_indicators) > 1:
         additional_indicator_names = [ind for ind in all_indicators if ind != index_name]
         for extra_idx_name in additional_indicator_names:
@@ -1522,10 +1951,19 @@ def run_temporal_comparison(
             extra_t2 = None
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = {}
-                if scene_sel_t1:
-                    futures["t1"] = executor.submit(_compute_index_stats, extra_idx_name, sensor, scene_sel_t1, bbox)
-                if scene_sel_t2:
-                    futures["t2"] = executor.submit(_compute_index_stats, extra_idx_name, sensor, scene_sel_t2, bbox)
+                # Use mosaic path when primary index used mosaic — ensures same shape
+                if selection_t1.scenes and len(selection_t1.scenes) > 0:
+                    scene_dicts_t1 = [s.to_dict() for s in selection_t1.scenes]
+                    futures["t1"] = executor.submit(
+                        _compute_index_from_mosaic_scenes,
+                        extra_idx_name, sensor, scene_dicts_t1, bbox, "period1_ndvi",
+                    )
+                if selection_t2.scenes and len(selection_t2.scenes) > 0:
+                    scene_dicts_t2 = [s.to_dict() for s in selection_t2.scenes]
+                    futures["t2"] = executor.submit(
+                        _compute_index_from_mosaic_scenes,
+                        extra_idx_name, sensor, scene_dicts_t2, bbox, "period2_ndvi",
+                    )
                 for key, future in futures.items():
                     result = future.result()
                     if key == "t1":
@@ -1533,513 +1971,586 @@ def run_temporal_comparison(
                     else:
                         extra_t2 = result
             if extra_t1 or extra_t2:
+                logger.info(
+                    "[SHAPE-TRACE] NDVI t1: shape=%s valid=%d t2: shape=%s valid=%d",
+                    extra_t1.shape if extra_t1 else None,
+                    extra_t1.valid_pixels if extra_t1 else 0,
+                    extra_t2.shape if extra_t2 else None,
+                    extra_t2.valid_pixels if extra_t2 else 0,
+                )
                 additional_indices[extra_idx_name] = {"t1": extra_t1, "t2": extra_t2}
                 processing_steps.append({
                     "step": f"compute_index_{extra_idx_name.lower()}",
                     "detail": f"{extra_idx_name} (supporting indicator): t1_mean={extra_t1.stats['mean'] if extra_t1 else 'N/A'}, t2_mean={extra_t2.stats['mean'] if extra_t2 else 'N/A'}",
                 })
 
-    # ── Step 5: Change detection ──────────────────────────────────
+    # ── Step 5: Common-grid reprojection + canonical change detection ────
     change_result = None
-    if index_t1 and index_t2:
-        # Use real raster arrays for pixel-level change detection when available
-        if index_t1.value is not None and index_t2.value is not None:
-            try:
-                import rasterio
-                from rasterio.transform import array_bounds
-
-                # Ensure same shape — reproject if needed
-                t1_arr = index_t1.value
-                t2_arr = index_t2.value
-
-                # Resize to common shape if different
-                min_h = min(t1_arr.shape[0], t2_arr.shape[0])
-                min_w = min(t1_arr.shape[1], t2_arr.shape[1])
-                t1_cropped = t1_arr[:min_h, :min_w]
-                t2_cropped = t2_arr[:min_h, :min_w]
-
-                # Pixel-level difference
-                diff = t2_cropped - t1_cropped
-
-                # Mask valid pixels (both must be valid)
-                valid_mask = ~np.isnan(t1_cropped) & ~np.isnan(t2_cropped) & ~np.isinf(t1_cropped) & ~np.isinf(t2_cropped)
-
-                # Water mask: exclude water/tidal pixels from change detection
-                water_t1 = t1_cropped < -0.1
-                water_t2 = t2_cropped < -0.1
-                water_mask = water_t1 & water_t2  # only exclude pixels that are water in BOTH periods
-                valid_mask = valid_mask & (~water_mask)
-                total_valid = int(np.sum(valid_mask))
-
-                # Adaptive threshold
-                from scipy import ndimage as _ndimage
-                valid_diff = diff[valid_mask]
-                if len(valid_diff) > 100:
-                    diff_std = float(np.std(valid_diff))
-                    threshold = max(0.08, min(0.20, 1.2 * diff_std))
-                else:
-                    threshold = 0.10
-                
-                # Vegetation preconditions: more lenient thresholds to detect real change
-                # Loss: significant NDVI decrease AND baseline had some vegetation
-                loss_cond = valid_mask & (diff < -threshold) & (t1_cropped >= 0.15)
-                # Gain: significant NDVI increase AND result has some vegetation  
-                gain_cond = valid_mask & (diff > threshold) & (t2_cropped >= 0.15)
-                changed_mask = loss_cond | gain_cond
-                
-                # Morphological cleaning: remove isolated noise pixels
-                struct = _ndimage.generate_binary_structure(2, 1)  # 4-connectivity
-                changed_mask = _ndimage.binary_opening(changed_mask, structure=struct, iterations=1)
-                
-                # Remove small connected regions (< 25 pixels = ~0.25 ha at 10m)
-                min_region_pixels = 25
-                labeled_raw, num_raw = _ndimage.label(changed_mask)
-                region_sizes = _ndimage.sum(changed_mask, labeled_raw, range(1, num_raw + 1))
-                cleaned = np.zeros_like(changed_mask)
-                for i, size in enumerate(region_sizes):
-                    if size >= min_region_pixels:
-                        cleaned[labeled_raw == (i + 1)] = True
-                changed_mask = cleaned
-                
-                changed_pixels = int(np.sum(changed_mask))
-
-                changed_pct = (changed_pixels / total_valid * 100) if total_valid > 0 else 0.0
-                pixel_area_sq_m = index_t1.resolution_m ** 2
-                changed_area_sq_m = changed_pixels * pixel_area_sq_m
-
-                # Statistics of the change
-                if changed_pixels > 0:
-                    changed_values = diff[changed_mask]
-                    change_stats = {
-                        "mean_change": round(float(np.mean(changed_values)), 4),
-                        "max_increase": round(float(np.max(changed_values)), 4),
-                        "max_decrease": round(float(np.min(changed_values)), 4),
-                        "std_change": round(float(np.std(changed_values)), 4),
-                    }
-                else:
-                    change_stats = {}
-
-                # Connected components on cleaned mask
-                labeled, num_regions = _ndimage.label(changed_mask)
-
-                change_result = {
-                    "status": "ok",
-                    "algorithm": "raster_difference",
-                    "index_name": index_name,
-                    "baseline_date": index_t1.date,
-                    "comparison_date": index_t2.date,
-                    "changed_pct": round(changed_pct, 4),
-                    "changed_pixels": changed_pixels,
-                    "total_pixels": total_valid,
-                    "num_regions": num_regions,
-                    "changed_area_sq_meters": round(changed_area_sq_m, 2),
-                    "threshold": threshold,
-                    "change_stats": change_stats,
-                    "baseline_stats": index_t1.stats,
-                    "comparison_stats": index_t2.stats,
-                    "raster_derived": True,
-                }
-
-                logger.info(
-                    "[%s] Change detection: %d/%d pixels changed (%.2f%%), %d regions",
-                    index_name, changed_pixels, total_valid, changed_pct, num_regions,
-                )
-
-            except Exception as e:
-                logger.error("Raster change detection failed: %s, falling back to stats-based", e)
-                # Fall back to stats-based
-                delta = index_t2.stats["mean"] - index_t1.stats["mean"]
-                change_result = {
-                    "status": "ok",
-                    "algorithm": "difference_threshold_fallback",
-                    "index_name": index_name,
-                    "baseline_date": index_t1.date,
-                    "comparison_date": index_t2.date,
-                    "changed_pct": round(abs(delta) * 100, 4),
-                    "changed_pixels": int(abs(delta) * index_t1.total_pixels),
-                    "total_pixels": index_t1.total_pixels,
-                    "num_regions": max(1, int(abs(delta) * 50)),
-                    "changed_area_sq_meters": abs(delta) * index_t1.total_pixels * (index_t1.resolution_m ** 2),
-                    "baseline_stats": index_t1.stats,
-                    "comparison_stats": index_t2.stats,
-                    "raster_derived": False,
-                }
-        else:
-            # No raster arrays available — use stats-based estimation
-            delta = index_t2.stats["mean"] - index_t1.stats["mean"]
-            change_result = {
-                "status": "ok",
-                "algorithm": "difference_threshold_estimated",
-                "index_name": index_name,
-                "baseline_date": index_t1.date,
-                "comparison_date": index_t2.date,
-                "changed_pct": round(abs(delta) * 100, 4),
-                "changed_pixels": int(abs(delta) * index_t1.total_pixels),
-                "total_pixels": index_t1.total_pixels,
-                "num_regions": max(1, int(abs(delta) * 50)),
-                "changed_area_sq_meters": abs(delta) * index_t1.total_pixels * (index_t1.resolution_m ** 2),
-                "baseline_stats": index_t1.stats,
-                "comparison_stats": index_t2.stats,
-                "raster_derived": False,
-            }
-
-        processing_steps.append({
-            "step": "change_detection",
-            "detail": f"algorithm={change_result.get('algorithm', 'unknown')}, changed={change_result.get('changed_pct', 0)}%",
-        })
-
-    # ── Step 5a: Multi-signal change analysis ────────────────────
-    # When multi-signal is enabled, combine primary + supporting indicators
-    # to produce more defensible candidate change regions.
-    multi_signal_result = None
-    if multi_signal_enabled and additional_indices and change_result is not None:
-        try:
-            multi_signal_result = _compute_multi_signal_change(
-                primary_index_name=index_name,
-                additional_indices=additional_indices,
-                signal_rules=signal_rules,
-                min_agreeing_signals=min_agreeing,
-                scene_t1=scene_sel_t1,
-                scene_t2=scene_sel_t2,
-                bbox=bbox,
-                resolution_m=index_t1.resolution_m if index_t1 else 10.0,
-                primary_change_result=change_result,
-            )
-            processing_steps.append({
-                "step": "multi_signal_analysis",
-                "detail": f"Combined {len(additional_indices) + 1} indicators, "
-                          f"{multi_signal_result.get('agreeing_pixels', 0)} agreeing pixels, "
-                          f"{multi_signal_result.get('candidate_changed_pct', 0):.2f}% candidate change",
-            })
-
-            # Enrich the main change_result with multi-signal evidence
-            if multi_signal_result.get("status") == "ok":
-                change_result["multi_signal"] = {
-                    "enabled": True,
-                    "indicators_used": [index_name] + list(additional_indices.keys()),
-                    "agreeing_pixels": multi_signal_result.get("agreeing_pixels", 0),
-                    "candidate_changed_pct": multi_signal_result.get("candidate_changed_pct", 0),
-                    "candidate_changed_area_sq_meters": multi_signal_result.get("candidate_changed_area_sq_meters", 0),
-                    "signal_details": multi_signal_result.get("signal_details", {}),
-                    "confidence_note": multi_signal_result.get("confidence_note", ""),
-                }
-        except Exception as e:
-            logger.warning("Multi-signal analysis failed: %s — falling back to single-signal", e)
-            processing_steps.append({
-                "step": "multi_signal_analysis",
-                "detail": f"Failed: {type(e).__name__}: {str(e)[:100]}",
-            })
-    elif multi_signal_enabled:
-        processing_steps.append({
-            "step": "multi_signal_analysis",
-            "detail": "Skipped — no additional indicator arrays available",
-        })
-
-    # ── Step 5c: Ensemble change detection (CVA + IR-MAD + Object-CD) ──
-    # Runs three independent algorithms and combines via majority voting.
-    # This is more robust than any single algorithm.
-    ensemble_mask = None
-    ensemble_confidence = None
-    ensemble_stats = {}
-    if index_t1 and index_t2 and index_t1.value is not None and index_t2.value is not None:
-        try:
-            from app.services.cva import run_cva
-            from app.services.mad import run_ir_mad
-            from app.services.object_cd import run_object_cd
-
-            t1_arr = index_t1.value.astype(np.float32)
-            t2_arr = index_t2.value.astype(np.float32)
-            min_h = min(t1_arr.shape[0], t2_arr.shape[0])
-            min_w = min(t1_arr.shape[1], t2_arr.shape[1])
-            t1_c = t1_arr[:min_h, :min_w]
-            t2_c = t2_arr[:min_h, :min_w]
-            delta = t2_c - t1_c
-
-            valid = ~np.isnan(t1_c) & ~np.isnan(t2_c) & ~np.isinf(t1_c) & ~np.isinf(t2_c)
-
-            # --- Algorithm 1: CVA (single-band mode for NDVI) ---
-            try:
-                cva_result = run_cva(
-                    t1_c, t2_c,
-                    band_names=[index_name],
-                    apply_normalization=True,
-                )
-                cva_mask = cva_result.change_mask & valid
-                processing_steps.append({
-                    "step": "ensemble_cva",
-                    "detail": f"changed={cva_result.changed_pixels}/{cva_result.total_pixels} ({cva_result.changed_pct}%), normalized={cva_result.normalized}",
-                })
-            except Exception as e:
-                cva_mask = np.zeros((min_h, min_w), dtype=bool)
-                logger.warning("[Ensemble] CVA failed: %s", e)
-                processing_steps.append({"step": "ensemble_cva", "detail": f"Failed: {type(e).__name__}: {str(e)[:80]}"})
-
-            # --- Algorithm 2: IR-MAD (multi-band requires reshaping) ---
-            try:
-                # For single-index mode, create pseudo multi-band with delta and original
-                bands_t1_3d = np.stack([t1_c, t2_c], axis=0)  # (2, H, W)
-                bands_t2_3d = np.stack([t1_c, t2_c], axis=0)  # Dummy for MAD
-                # Actually MAD needs two different time images — use the index arrays
-                bands_t1_mad = t1_c[np.newaxis, ...]  # (1, H, W)
-                bands_t2_mad = t2_c[np.newaxis, ...]  # (1, H, W)
-                mad_result = run_ir_mad(
-                    bands_t1_mad, bands_t2_mad,
-                    significance_level=0.01,
-                )
-                mad_mask = mad_result.change_mask & valid
-                processing_steps.append({
-                    "step": "ensemble_mad",
-                    "detail": f"changed={mad_result.changed_pixels}/{mad_result.total_pixels} ({mad_result.changed_pct}%), converged={mad_result.converged}",
-                })
-            except Exception as e:
-                mad_mask = np.zeros((min_h, min_w), dtype=bool)
-                logger.warning("[Ensemble] IR-MAD failed: %s", e)
-                processing_steps.append({"step": "ensemble_mad", "detail": f"Failed: {type(e).__name__}: {str(e)[:80]}"})
-
-            # --- Algorithm 3: Object-based multi-scale ---
-            try:
-                obj_result = run_object_cd(
-                    delta,
-                    scale_sigmas=[0.0, 1.5, 3.0, 6.0],
-                    min_agreement=2,
-                    min_object_size=10,
-                )
-                obj_mask = obj_result.change_mask & valid
-                ensemble_confidence = obj_result.confidence
-                processing_steps.append({
-                    "step": "ensemble_object_cd",
-                    "detail": f"changed={obj_result.changed_pixels}/{obj_result.total_pixels} ({obj_result.changed_pct}%), objects={obj_result.n_objects}",
-                })
-            except Exception as e:
-                obj_mask = np.zeros((min_h, min_w), dtype=bool)
-                logger.warning("[Ensemble] Object-CD failed: %s", e)
-                processing_steps.append({"step": "ensemble_object_cd", "detail": f"Failed: {type(e).__name__}: {str(e)[:80]}"})
-
-            # --- Ensemble voting: pixel is changed if ≥2/3 algorithms agree ---
-            vote_count = cva_mask.astype(int) + mad_mask.astype(int) + obj_mask.astype(int)
-            ensemble_mask = vote_count >= 2
-
-            ensemble_changed = int(np.sum(ensemble_mask))
-            ensemble_total = int(np.sum(valid))
-            ensemble_pct = (ensemble_changed / ensemble_total * 100) if ensemble_total > 0 else 0.0
-
-            ensemble_stats = {
-                "algorithm": "ensemble_cva_mad_object",
-                "n_algorithms": 3,
-                "min_agreement": 2,
-                "changed_pixels": ensemble_changed,
-                "total_valid_pixels": ensemble_total,
-                "changed_pct": round(ensemble_pct, 4),
-                "cva_changed": int(np.sum(cva_mask)),
-                "mad_changed": int(np.sum(mad_mask)),
-                "object_changed": int(np.sum(obj_mask)),
-            }
-
-            processing_steps.append({
-                "step": "ensemble_voting",
-                "detail": f"cva={int(np.sum(cva_mask))}, mad={int(np.sum(mad_mask))}, obj={int(np.sum(obj_mask))}, ensemble={ensemble_changed} ({ensemble_pct:.2f}%)",
-            })
-
-            logger.info(
-                "[Ensemble] CVA=%d, MAD=%d, Object=%d, Ensemble=%d/%d (%.2f%%)",
-                int(np.sum(cva_mask)), int(np.sum(mad_mask)), int(np.sum(obj_mask)),
-                ensemble_changed, ensemble_total, ensemble_pct,
-            )
-
-        except Exception as e:
-            logger.warning("[Ensemble] Failed: %s — falling back to threshold method", e)
-            processing_steps.append({
-                "step": "ensemble_detection",
-                "detail": f"Failed: {type(e).__name__}: {str(e)[:100]}",
-            })
-
-    # ── Step 5b: Generate NDVI-based categorical change mask ────
-    # Uses the actual spectral index arrays (NDVI/NDBI/etc.), NOT raw RGB pixels.
-    # Classifies into: Vegetation Loss / Stable / Vegetation Gain / No Data
+    change_result_obj = None
+    analysis_grid_info = None
     change_mask_b64 = None
     diff_vis_b64 = None
     change_vis_stats = {}
+    scl_available = False
+    cloud_mask_t1 = None
+    cloud_mask_t2 = None
+    t1_aligned = None
+    t2_aligned = None
+
     if index_t1 and index_t2 and index_t1.value is not None and index_t2.value is not None:
         try:
-            from scipy import ndimage as _ndimage_vis
+            from app.services.raster_service import reproject_to_grid, determine_common_grid
+            from app.services.change_detection import run_change_detection
 
-            t1_arr = index_t1.value.astype(np.float32)
-            t2_arr = index_t2.value.astype(np.float32)
-            min_h = min(t1_arr.shape[0], t2_arr.shape[0])
-            min_w = min(t1_arr.shape[1], t2_arr.shape[1])
-            t1_c = t1_arr[:min_h, :min_w]
-            t2_c = t2_arr[:min_h, :min_w]
+            # Get the raster hrefs for determining the common grid
+            # We need the actual COG URLs to read CRS/transform info
+            band_key_t1 = (selection_t1.collection, index_name)
+            band_key_t2 = (selection_t2.collection, index_name)
+            band_map_t1 = _INDEX_BAND_MAP.get(band_key_t1)
+            band_map_t2 = _INDEX_BAND_MAP.get(band_key_t2)
 
-            # Valid pixel mask: both scenes must have valid (non-NaN, non-zero) data
-            valid = (~np.isnan(t1_c)) & (~np.isnan(t2_c)) & (~np.isinf(t1_c)) & (~np.isinf(t2_c))
-            valid = valid & (np.abs(t1_c) > 0.001) & (np.abs(t2_c) > 0.001)
+            if band_map_t1 and band_map_t2 and selection_t1.scenes and selection_t2.scenes:
+                # Get the first required band href from each period's first scene
+                index_def = _INDEX_DEFINITIONS.get(index_name)
+                if index_def:
+                    first_logical = index_def.bands_required[0]
+                    physical_t1 = band_map_t1.get(first_logical)
+                    physical_t2 = band_map_t2.get(first_logical)
 
-            # --- Water mask using NDVI proxy ---
-            # Only exclude pixels that are clearly water in BOTH periods
-            water_t1 = t1_c < -0.1  # clearly water in period 1
-            water_t2 = t2_c < -0.1  # clearly water in period 2
-            water_mask = water_t1 & water_t2  # only exclude pixels water in BOTH periods
+                    href1 = ""
+                    href2 = ""
+                    if physical_t1:
+                        asset = selection_t1.scenes[0].assets.get(physical_t1)
+                        if asset:
+                            href1 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
+                    if physical_t2:
+                        asset = selection_t2.scenes[0].assets.get(physical_t2)
+                        if asset:
+                            href2 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
 
-            valid = valid & (~water_mask)
-            total_valid_pixels = int(np.sum(valid))
+                    if href1 and href2:
+                        # Determine common analysis grid
+                        analysis_grid_info = determine_common_grid(href1, href2, bbox)
+                        analysis_crs = str(analysis_grid_info["crs"])
+                        analysis_transform = analysis_grid_info["transform"]
+                        analysis_shape = (analysis_grid_info["height"], analysis_grid_info["width"])
+                        analysis_resolution = analysis_grid_info["resolution_meters"]
 
-            # Compute delta: index_after - index_before
-            delta = np.where(valid, t2_c - t1_c, np.nan)
+                        processing_steps.append({
+                            "step": "common_grid",
+                            "detail": (
+                                f"crs={analysis_crs}, res={analysis_resolution:.1f}m, "
+                                f"{analysis_shape[1]}x{analysis_shape[0]}, "
+                                f"source1={analysis_grid_info['source_crs1']}, "
+                                f"source2={analysis_grid_info['source_crs2']}"
+                            ),
+                        })
 
-            # --- Adaptive threshold ---
-            valid_delta = delta[valid]
-            if len(valid_delta) > 100:
-                delta_std = float(np.std(valid_delta))
-                threshold = max(0.08, min(0.20, 1.2 * delta_std))
+                        # Read raster metadata to get source CRS/transform for reprojection
+                        import rasterio
+                        import os as _os_raster
+                        for _k in ['GDAL_CACHEMAX', 'GDAL_DISABLE_READDIR_ON_OPEN',
+                                   'CPL_VSIL_CURL_ALLOWED_EXTENSIONS', 'GDAL_HTTP_TIMEOUT', 'GDAL_HTTP_MAX_RETRY']:
+                            if _k in _os_raster.environ:
+                                del _os_raster.environ[_k]
+
+                        # Read source grid info from both scenes
+                        with rasterio.Env(GDAL_CACHEMAX=64, GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", GDAL_HTTP_TIMEOUT="30"):
+                            with rasterio.open(href1) as src1:
+                                src1_crs = src1.crs
+                                src1_transform = src1.transform
+
+                            with rasterio.open(href2) as src2:
+                                src2_crs = src2.crs
+                                src2_transform = src2.transform
+
+                        # Reproject both index arrays onto the common grid
+                        t1_aligned = reproject_to_grid(
+                            index_t1.value, src1_crs, src1_transform,
+                            analysis_grid_info["crs"], analysis_transform, analysis_shape,
+                        )
+                        t2_aligned = reproject_to_grid(
+                            index_t2.value, src2_crs, src2_transform,
+                            analysis_grid_info["crs"], analysis_transform, analysis_shape,
+                        )
+
+                        logger.info(
+                            "[SHAPE-TRACE] Common grid target: shape=%s crs=%s res=%.2fm",
+                            analysis_shape, analysis_crs, analysis_resolution,
+                        )
+                        logger.info(
+                            "[SHAPE-TRACE] T1 NDBI BEFORE reprojection: %s src_crs=%s",
+                            index_t1.value.shape, src1_crs,
+                        )
+                        logger.info(
+                            "[SHAPE-TRACE] T2 NDBI BEFORE reprojection: %s src_crs=%s",
+                            index_t2.value.shape, src2_crs,
+                        )
+                        logger.info(
+                            "[SHAPE-TRACE] T1 AFTER reprojection: %s",
+                            t1_aligned.shape,
+                        )
+                        logger.info(
+                            "[SHAPE-TRACE] T2 AFTER reprojection: %s",
+                            t2_aligned.shape,
+                        )
+                        logger.info(
+                            "Common grid reprojection: t1 %s→%s, t2 %s→%s",
+                            src1_crs, analysis_crs, src2_crs, analysis_crs,
+                        )
+                    else:
+                        # Cannot determine common grid — geographic correspondence NOT guaranteed.
+                        # Do NOT silently crop. Fail clearly.
+                        processing_steps.append({
+                            "step": "common_grid",
+                            "detail": "FAILED: cannot determine common grid (no band hrefs available).",
+                        })
+                        raise RuntimeError(
+                            "Cannot determine common analysis grid — band hrefs unavailable. "
+                            f"Period 1 shape: {index_t1.value.shape}, Period 2 shape: {index_t2.value.shape}. "
+                            "Geographic correspondence cannot be guaranteed."
+                        )
+                else:
+                    # No band mapping available for this sensor/index combination.
+                    processing_steps.append({
+                        "step": "common_grid",
+                        "detail": "FAILED: no band mapping for sensor/index.",
+                    })
+                    raise RuntimeError(
+                        f"No band mapping for {index_name} on {selection_t1.collection}. "
+                        "Cannot determine common analysis grid."
+                    )
             else:
-                threshold = 0.10
-
-            # --- Classify into categorical mask ---
-            # Use ensemble mask if available (from CVA+IR-MAD+Object-CD),
-            # otherwise fall back to threshold-based classification
-            if ensemble_mask is not None and ensemble_mask.shape == (min_h, min_w):
-                # Ensemble-validated change: classify by direction of delta
-                loss_condition = ensemble_mask & valid & (delta < 0)
-                gain_condition = ensemble_mask & valid & (delta > 0)
-                classification = np.zeros((min_h, min_w), dtype=np.uint8)
-                classification[valid] = 2  # Default: Stable
-                classification[loss_condition] = 1  # Loss
-                classification[gain_condition] = 3   # Gain
+                # No scenes available for grid determination.
                 processing_steps.append({
-                    "step": "mask_source",
-                    "detail": f"Using ENSEMBLE mask ({int(np.sum(ensemble_mask))} changed pixels from CVA+MAD+ObjectCD)",
+                    "step": "common_grid",
+                    "detail": "FAILED: no scenes available for grid determination.",
                 })
-            else:
-                # Fallback: threshold-based classification
-                loss_condition = valid & (delta < -threshold) & (t1_c >= 0.15)
-                gain_condition = valid & (delta > threshold) & (t2_c >= 0.15)
-                classification = np.zeros((min_h, min_w), dtype=np.uint8)
-                classification[valid] = 2  # Default: Stable
-                classification[loss_condition] = 1  # Loss
-                classification[gain_condition] = 3   # Gain
+                raise RuntimeError(
+                    "No scenes available for common grid determination. "
+                    "Cannot compare periods without aligned rasters."
+                )
+
+            # ── SCL cloud/shadow masking (Sentinel-2 only) ────
+            # SCL is categorical integer data at 20m resolution.
+            # It MUST be reprojected onto the exact analysis grid using
+            # nearest-neighbor resampling to preserve class values.
+            cloud_mask_t1 = None
+            cloud_mask_t2 = None
+            scl_available = False
+            if selection_t1.collection == 'sentinel-2-l2a' and selection_t1.scenes:
+                try:
+                    scl_asset_t1 = selection_t1.scenes[0].assets.get('SCL')
+                    scl_asset_t2 = selection_t2.scenes[0].assets.get('SCL') if selection_t2.scenes else None
+                    scl_href1 = scl_asset_t1.get('href', '') if isinstance(scl_asset_t1, dict) else ''
+                    scl_href2 = scl_asset_t2.get('href', '') if isinstance(scl_asset_t2, dict) else ''
+                    if scl_href1 and scl_href2:
+                        from app.services.raster_service import read_raster_window, reproject_to_grid
+                        from app.services.compositor import create_cloud_mask
+                        import rasterio as _rio_scl
+
+                        # Read SCL band from both periods
+                        scl_data_t1 = read_raster_window(scl_href1, bbox, max_dim=1024)
+                        scl_data_t2 = read_raster_window(scl_href2, bbox, max_dim=1024)
+                        scl_arr_t1 = scl_data_t1['data']
+                        scl_arr_t2 = scl_data_t2['data']
+                        if scl_arr_t1.ndim == 3:
+                            scl_arr_t1 = scl_arr_t1[0]
+                        if scl_arr_t2.ndim == 3:
+                            scl_arr_t2 = scl_arr_t2[0]
+
+                        # Get SCL source CRS and transform
+                        scl_crs_t1 = scl_data_t1.get('crs', 'EPSG:4326')
+                        scl_transform_t1 = scl_data_t1.get('transform')
+                        scl_crs_t2 = scl_data_t2.get('crs', 'EPSG:4326')
+                        scl_transform_t2 = scl_data_t2.get('transform')
+
+                        # CRITICAL: Reproject SCL onto the exact analysis grid
+                        # using nearest-neighbor to preserve integer class values.
+                        # Bilinear/cubic would interpolate between classes (wrong).
+                        scl_reproj_t1 = reproject_to_grid(
+                            scl_arr_t1.astype(np.float32),
+                            scl_crs_t1, scl_transform_t1,
+                            analysis_grid_info['crs'], analysis_transform, analysis_shape,
+                            resampling_method='nearest',
+                        )
+                        scl_reproj_t2 = reproject_to_grid(
+                            scl_arr_t2.astype(np.float32),
+                            scl_crs_t2, scl_transform_t2,
+                            analysis_grid_info['crs'], analysis_transform, analysis_shape,
+                            resampling_method='nearest',
+                        )
+
+                        # Verify SCL is on the exact same grid as the analysis arrays
+                        assert scl_reproj_t1.shape == t1_aligned.shape, (
+                            f"SCL shape {scl_reproj_t1.shape} != analysis shape {t1_aligned.shape}"
+                        )
+                        assert scl_reproj_t2.shape == t2_aligned.shape, (
+                            f"SCL shape {scl_reproj_t2.shape} != analysis shape {t2_aligned.shape}"
+                        )
+
+                        # Create boolean cloud mask from reprojected SCL
+                        # SCL values are integers; nearest-neighbor preserves them
+                        cloud_mask_t1 = create_cloud_mask(scl_reproj_t1)
+                        cloud_mask_t2 = create_cloud_mask(scl_reproj_t2)
+                        scl_available = True
+                        scl_cloud_pct_t1 = (1.0 - np.mean(cloud_mask_t1)) * 100
+                        scl_cloud_pct_t2 = (1.0 - np.mean(cloud_mask_t2)) * 100
+                        processing_steps.append({
+                            "step": "scl_masking",
+                            "detail": (
+                                f"SCL reprojected to analysis grid (nearest-neighbor): "
+                                f"{scl_reproj_t1.shape[1]}x{scl_reproj_t1.shape[0]} @ "
+                                f"{analysis_grid_info['crs']}, "
+                                f"cloud={scl_cloud_pct_t1:.1f}%/{scl_cloud_pct_t2:.1f}% "
+                                f"(period1/period2)"
+                            ),
+                        })
+                except Exception as e:
+                    logger.warning("SCL masking failed: %s — continuing without cloud mask", e, exc_info=True)
+            if not scl_available:
                 processing_steps.append({
-                    "step": "mask_source",
-                    "detail": "Using THRESHOLD-based mask (ensemble unavailable)",
+                    "step": "scl_masking",
+                    "detail": "SCL unavailable — using nodata-only masking",
                 })
 
-            # --- Morphological filtering ---
-            # Remove isolated noise pixels using binary opening
-            struct = _ndimage_vis.generate_binary_structure(2, 1)  # 4-connectivity
+            # ── SHAPE VERIFICATION: all inputs to change detection ────
+            logger.info(
+                "[SHAPE-TRACE] PRE-CHANGE-DETECTION: t1_NDBI=%s t2_NDBI=%s",
+                t1_aligned.shape if t1_aligned is not None else None,
+                t2_aligned.shape if t2_aligned is not None else None,
+            )
+            logger.info(
+                "[SHAPE-TRACE] PRE-CHANGE-DETECTION: cloud_t1=%s cloud_t2=%s",
+                cloud_mask_t1.shape if cloud_mask_t1 is not None else None,
+                cloud_mask_t2.shape if cloud_mask_t2 is not None else None,
+            )
+            logger.info(
+                "[SHAPE-TRACE] PRE-CHANGE-DETECTION: grid crs=%s transform=%s shape=%s res=%.2fm",
+                analysis_crs, analysis_transform, analysis_shape, analysis_resolution,
+            )
 
-            # Filter loss regions (min 25 pixels = ~0.25 ha at 10m)
-            loss_mask = classification == 1
-            loss_cleaned = _ndimage_vis.binary_opening(loss_mask, structure=struct, iterations=1)
-            min_region = 25
-            labeled_loss, n_loss = _ndimage_vis.label(loss_cleaned)
-            if n_loss > 0:
-                sizes_loss = _ndimage_vis.sum(loss_cleaned, labeled_loss, range(1, n_loss + 1))
-                for i, sz in enumerate(sizes_loss):
-                    if sz < min_region:
-                        loss_cleaned[labeled_loss == (i + 1)] = False
+            # ── Reproject NDVI support index to analysis grid ────
+            ndvi_baseline_aligned = None
+            ndvi_comparison_aligned = None
+            ndvi_data = additional_indices.get("NDVI")
+            if ndvi_data and ndvi_data.get("t1") and ndvi_data.get("t2"):
+                ndvi_t1_obj = ndvi_data["t1"]
+                ndvi_t2_obj = ndvi_data["t2"]
+                if ndvi_t1_obj.value is not None and ndvi_t2_obj.value is not None:
+                    try:
+                        # Read NDVI source CRS/transform from the first scene's B08 band
+                        ndvi_band_key = (selection_t1.collection, "NDVI")
+                        ndvi_band_map = _INDEX_BAND_MAP.get(ndvi_band_key)
+                        if ndvi_band_map and selection_t1.scenes and selection_t2.scenes:
+                            ndvi_index_def = _INDEX_DEFINITIONS.get("NDVI")
+                            if ndvi_index_def:
+                                ndvi_logical = ndvi_index_def.bands_required[0]
+                                ndvi_physical_t1 = ndvi_band_map.get(ndvi_logical)
+                                ndvi_physical_t2 = ndvi_band_map.get(ndvi_logical)
+                                ndvi_href1 = ""
+                                ndvi_href2 = ""
+                                if ndvi_physical_t1:
+                                    asset = selection_t1.scenes[0].assets.get(ndvi_physical_t1)
+                                    if asset:
+                                        ndvi_href1 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
+                                if ndvi_physical_t2:
+                                    asset = selection_t2.scenes[0].assets.get(ndvi_physical_t2)
+                                    if asset:
+                                        ndvi_href2 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
 
-            # Filter gain regions (min 25 pixels = ~0.25 ha at 10m)
-            gain_mask = classification == 3
-            gain_cleaned = _ndimage_vis.binary_opening(gain_mask, structure=struct, iterations=1)
-            labeled_gain, n_gain = _ndimage_vis.label(gain_cleaned)
-            if n_gain > 0:
-                sizes_gain = _ndimage_vis.sum(gain_cleaned, labeled_gain, range(1, n_gain + 1))
-                for i, sz in enumerate(sizes_gain):
-                    if sz < min_region:
-                        gain_cleaned[labeled_gain == (i + 1)] = False
+                                if ndvi_href1 and ndvi_href2:
+                                    with rasterio.Env(GDAL_CACHEMAX=64, GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", GDAL_HTTP_TIMEOUT="30"):
+                                        with rasterio.open(ndvi_href1) as ndvi_src1:
+                                            ndvi_src1_crs = ndvi_src1.crs
+                                            ndvi_src1_transform = ndvi_src1.transform
+                                        with rasterio.open(ndvi_href2) as ndvi_src2:
+                                            ndvi_src2_crs = ndvi_src2.crs
+                                            ndvi_src2_transform = ndvi_src2.transform
 
-            # Rebuild classification from cleaned masks
-            final_class = np.zeros((min_h, min_w), dtype=np.uint8)  # 0 = No Data
-            final_class[valid] = 2  # Stable
-            final_class[loss_cleaned] = 1  # Loss (overwrites stable)
-            final_class[gain_cleaned] = 3  # Gain (overwrites stable)
+                                    ndvi_baseline_aligned = reproject_to_grid(
+                                        ndvi_t1_obj.value, ndvi_src1_crs, ndvi_src1_transform,
+                                        analysis_grid_info["crs"], analysis_transform, analysis_shape,
+                                    )
+                                    ndvi_comparison_aligned = reproject_to_grid(
+                                        ndvi_t2_obj.value, ndvi_src2_crs, ndvi_src2_transform,
+                                        analysis_grid_info["crs"], analysis_transform, analysis_shape,
+                                    )
+                                    logger.info(
+                                        "[SHAPE-TRACE] NDVI AFTER reprojection: t1=%s t2=%s",
+                                        ndvi_baseline_aligned.shape, ndvi_comparison_aligned.shape,
+                                    )
+                    except Exception as e:
+                        logger.warning("NDVI reprojection failed: %s — running without NDVI support", e, exc_info=True)
+                        ndvi_baseline_aligned = None
+                        ndvi_comparison_aligned = None
 
-            # --- Generate categorical RGBA image ---
-            # Loss  = warm red (220, 60, 60)  — semi-transparent
-            # Stable = very dark, nearly invisible — lets the basemap show through
-            # Gain  = green (34, 180, 90) — semi-transparent
-            # No Data = dark charcoal (20, 28, 24) — opaque
-            mask_img = np.zeros((min_h, min_w, 4), dtype=np.uint8)
+            # Run change detection through the unified detector interface
+            from app.services.detector_interface import detect_change, get_supported_methods
+            detector_method = plan.get("change_detection_method", "phenomenon_aware_difference")
+            logger.info("[DETECTOR] Selected method: %s", detector_method)
 
-            # No Data (opaque dark)
-            nodata = final_class == 0
-            mask_img[nodata] = [20, 28, 24, 255]
+            # Pre-compute scene IDs and provenance data for GeoJSON enrichment
+            _prov_scene_ids_t1 = [s.item_id for s in selection_t1.scenes] if selection_t1 and selection_t1.scenes else []
+            _prov_scene_ids_t2 = [s.item_id for s in selection_t2.scenes] if selection_t2 and selection_t2.scenes else []
+            _prov_acq_dates_t1 = [s.datetime for s in selection_t1.scenes] if selection_t1 and selection_t1.scenes else []
+            _prov_acq_dates_t2 = [s.datetime for s in selection_t2.scenes] if selection_t2 and selection_t2.scenes else []
+            _prov_cloud_covers_t1 = [s.cloud_cover for s in selection_t1.scenes] if selection_t1 and selection_t1.scenes else []
+            _prov_cloud_covers_t2 = [s.cloud_cover for s in selection_t2.scenes] if selection_t2 and selection_t2.scenes else []
+            _prov_all_scene_ids = _prov_scene_ids_t1 + _prov_scene_ids_t2
+            _prov_aoi_coverage = (selection_t1.coverage_ratio if selection_t1 else None)
 
-            # Stable (nearly invisible — very low alpha so basemap shows through)
-            stable = final_class == 2
-            mask_img[stable] = [15, 22, 18, 30]  # barely visible tint
+            # Quality mask provenance
+            _prov_scl_usage = "SCL categorical masking (nearest-neighbor reprojected)" if scl_available else "nodata-only masking"
+            _prov_cloud_shadow_handling = "SCL classes 3,8,9,10 masked" if scl_available else "nodata threshold"
+            _prov_quality_mask = "SCL (Scene Classification Layer)" if scl_available else "nodata"
 
-            # Vegetation Loss (red, strong alpha)
-            loss_final = final_class == 1
-            mask_img[loss_final] = [220, 60, 60, 180]
+            # Index formulas
+            _prov_formulas = {}
+            if _INDEX_DEFINITIONS:
+                _prov_formulas[index_name] = _INDEX_DEFINITIONS[index_name].formula
+                for r in signal_rules:
+                    rname = r.get("index_name")
+                    if rname and rname != index_name and rname in _INDEX_DEFINITIONS:
+                        _prov_formulas[rname] = _INDEX_DEFINITIONS[rname].formula
 
-            # Vegetation Gain (green, strong alpha)
-            gain_final = final_class == 3
-            mask_img[gain_final] = [34, 180, 90, 180]
+            # Composite method provenance
+            _prov_n_t1 = len(selection_t1.scenes) if selection_t1 and selection_t1.scenes else 0
+            _prov_n_t2 = len(selection_t2.scenes) if selection_t2 and selection_t2.scenes else 0
+            _prov_composite = f"StackSTAC mosaic ({_prov_n_t1} scenes)" if (_prov_n_t1 > 1) else f"single scene read"
 
-            change_mask_b64 = _encode_rgba_png(mask_img)
+            _prov_common_kwargs = dict(
+                scene_ids=_prov_all_scene_ids,
+                collection=collection,
+                supporting_indices=[r.get("index_name") for r in signal_rules if r.get("index_name") != index_name] if signal_rules else [],
+                indicator_formulas=_prov_formulas,
+                quality_mask=_prov_quality_mask,
+                scl_usage=_prov_scl_usage,
+                cloud_shadow_handling=_prov_cloud_shadow_handling,
+                composite_method=_prov_composite,
+                observation_count={"period_1": _prov_n_t1, "period_2": _prov_n_t2},
+                provider="planetary_computer",
+                platform=selection_t1.platform if selection_t1 else "unknown",
+                instrument="MSI" if "sentinel" in collection.lower() else "OLI",
+                processing_level="L2A" if "l2a" in collection.lower() else "unknown",
+                acquisition_dates=_prov_acq_dates_t1 + _prov_acq_dates_t2,
+                cloud_cover=_prov_cloud_covers_t1 + _prov_cloud_covers_t2,
+                aoi_coverage=_prov_aoi_coverage,
+            )
 
-            # --- Compute statistics from the FINAL filtered mask ---
-            pixel_area_sq_m = index_t1.resolution_m ** 2
-            loss_pixels = int(np.sum(final_class == 1))
-            gain_pixels = int(np.sum(final_class == 3))
-            stable_pixels = int(np.sum(final_class == 2))
-            nodata_pixels = int(np.sum(final_class == 0))
-            changed_pixels_total = loss_pixels + gain_pixels
+            try:
+                change_result_obj = detect_change(
+                    baseline=t1_aligned,
+                    comparison=t2_aligned,
+                    index_name=index_name,
+                    aoi_bbox=bbox,
+                    detector_method=detector_method,
+                    baseline_date=index_t1.date,
+                    comparison_date=index_t2.date,
+                    crs=analysis_crs,
+                    resolution_meters=analysis_resolution,
+                    phenomenon=phenomenon,
+                    baseline_transform=analysis_transform,
+                    comparison_transform=analysis_transform,
+                    # Invert SCL masks: create_cloud_mask returns True=VALID,
+                    # but compute_valid_mask expects True=CLOUD
+                    cloud_baseline=~cloud_mask_t1 if cloud_mask_t1 is not None else None,
+                    cloud_comparison=~cloud_mask_t2 if cloud_mask_t2 is not None else None,
+                    # Pass reprojected NDVI for multi-signal AND logic
+                    ndvi_baseline=ndvi_baseline_aligned,
+                    ndvi_comparison=ndvi_comparison_aligned,
+                    # Pass explicit thresholds from plan's signal rules (authoritative source)
+                    ndbi_threshold=plan_ndbi_threshold,
+                    ndvi_decrease_threshold=plan_ndvi_threshold,
+                    **_prov_common_kwargs,
+                )
+            except (ValueError, TypeError) as e:
+                # Fallback to default method if selected method fails (e.g. CVA needs multi-band)
+                logger.warning(
+                    "[DETECTOR] Method '%s' failed: %s. Falling back to phenomenon_aware_difference",
+                    detector_method, e,
+                )
+                change_result_obj = detect_change(
+                    baseline=t1_aligned,
+                    comparison=t2_aligned,
+                    index_name=index_name,
+                    aoi_bbox=bbox,
+                    detector_method="phenomenon_aware_difference",
+                    baseline_date=index_t1.date,
+                    comparison_date=index_t2.date,
+                    crs=analysis_crs,
+                    resolution_meters=analysis_resolution,
+                    phenomenon=phenomenon,
+                    baseline_transform=analysis_transform,
+                    comparison_transform=analysis_transform,
+                    cloud_baseline=~cloud_mask_t1 if cloud_mask_t1 is not None else None,
+                    cloud_comparison=~cloud_mask_t2 if cloud_mask_t2 is not None else None,
+                    ndvi_baseline=ndvi_baseline_aligned,
+                    ndvi_comparison=ndvi_comparison_aligned,
+                    ndvi_decrease_threshold=plan_ndvi_threshold,
+                    **_prov_common_kwargs,
+                )
 
+            # Convert ChangeDetectionResult to dict for API response
+            change_result = {
+                "status": change_result_obj.status,
+                "algorithm": change_result_obj.algorithm,
+                "index_name": change_result_obj.index_name,
+                "baseline_date": change_result_obj.baseline_date,
+                "comparison_date": change_result_obj.comparison_date,
+                "changed_pct": change_result_obj.changed_pct,
+                "changed_pixels": change_result_obj.changed_pixels,
+                "total_pixels": change_result_obj.total_pixels,
+                "num_regions": change_result_obj.num_regions,
+                "changed_area_sq_meters": change_result_obj.changed_area_sq_meters,
+                "total_area_sq_meters": change_result_obj.total_area_sq_meters,
+                "valid_area_sq_meters": change_result_obj.valid_area_sq_meters,
+                "baseline_stats": change_result_obj.baseline_stats,
+                "comparison_stats": change_result_obj.comparison_stats,
+                "difference_stats": change_result_obj.difference_stats,
+                "raster_derived": True,
+                "threshold": change_result_obj.parameters.get("threshold"),
+                "change_stats": change_result_obj.difference_stats,
+                "crs": change_result_obj.crs,
+                "resolution_meters": change_result_obj.resolution_meters,
+                "valid_pixel_ratio": change_result_obj.valid_pixel_ratio,
+                "nodata_pixels": change_result_obj.nodata_pixels,
+                "cloud_masked_pixels": change_result_obj.cloud_masked_pixels,
+            }
+
+            # GeoJSON regions from the canonical pipeline
+            if change_result_obj.change_geojson:
+                change_result["change_geojson"] = change_result_obj.change_geojson
+                # Enrich top-level GeoJSON properties with scene_ids and collection
+                all_scene_ids = _prov_all_scene_ids
+                change_result["change_geojson"]["properties"]["scene_ids"] = all_scene_ids
+                change_result["change_geojson"]["properties"]["collection"] = collection
+            if change_result_obj.regions:
+                change_result["regions"] = change_result_obj.regions
+
+            # ── CONSISTENCY VALIDATION ────────────────────────────
+            # Verify that region counts and area calculations agree.
+            # If any disagree, log a clear failure (do NOT round until they match).
+            _api_region_count = change_result.get("num_regions", 0)
+            _geojson_region_count = len(change_result_obj.change_geojson.get("features", [])) if change_result_obj.change_geojson else 0
+            _frontend_region_count = len(change_result_obj.regions)
+
+            pixel_area_sq_m = analysis_resolution ** 2
+            _calc_changed_area = change_result_obj.changed_pixels * pixel_area_sq_m
+            _reported_changed_area = change_result_obj.changed_area_sq_meters
+
+            region_count_ok = (_api_region_count == _geojson_region_count == _frontend_region_count)
+            area_calc_ok = (abs(_calc_changed_area - _reported_changed_area) < 1.0)  # 1 m² tolerance
+
+            if not region_count_ok:
+                logger.error(
+                    "[CONSISTENCY-FAIL] Region count mismatch: "
+                    "api=%d, geojson=%d, frontend=%d",
+                    _api_region_count, _geojson_region_count, _frontend_region_count,
+                )
+            if not area_calc_ok:
+                logger.error(
+                    "[CONSISTENCY-FAIL] Area calculation mismatch: "
+                    "changed_pixels(%d) * pixel_area(%.1f m²) = %.1f m², "
+                    "reported = %.1f m², diff = %.1f m²",
+                    change_result_obj.changed_pixels, pixel_area_sq_m,
+                    _calc_changed_area, _reported_changed_area,
+                    abs(_calc_changed_area - _reported_changed_area),
+                )
+
+            change_result["consistency_validation"] = {
+                "region_count": {
+                    "api": _api_region_count,
+                    "geojson": _geojson_region_count,
+                    "frontend": _frontend_region_count,
+                    "consistent": region_count_ok,
+                },
+                "area_calculation": {
+                    "changed_pixels": change_result_obj.changed_pixels,
+                    "pixel_area_m2": round(pixel_area_sq_m, 2),
+                    "calculated_area_m2": round(_calc_changed_area, 2),
+                    "reported_area_m2": round(_reported_changed_area, 2),
+                    "difference_m2": round(abs(_calc_changed_area - _reported_changed_area), 2),
+                    "consistent": area_calc_ok,
+                },
+            }
+
+            # Change mask visualization (sparse — only changed pixels)
+            change_mask_b64 = change_result_obj.change_visualization_png
+
+            # Statistics from the cleaned mask
+            pixel_area_sq_m = analysis_resolution ** 2
+            loss_pixels = 0
+            gain_pixels = 0
+            for region in change_result_obj.regions:
+                if region.get("direction") == "decrease":
+                    loss_pixels += region.get("area_pixels", 0)
+                elif region.get("direction") == "increase":
+                    gain_pixels += region.get("area_pixels", 0)
+            stable_pixels = change_result_obj.total_pixels - change_result_obj.changed_pixels
             loss_area_km2 = loss_pixels * pixel_area_sq_m / 1e6
             gain_area_km2 = gain_pixels * pixel_area_sq_m / 1e6
-            stable_area_km2 = stable_pixels * pixel_area_sq_m / 1e6
-            total_analyzed_km2 = (total_valid_pixels * pixel_area_sq_m) / 1e6
 
-            # Dominant trend
             if loss_pixels > gain_pixels * 1.5:
-                dominant_trend = "vegetation_loss"
+                dominant_trend = "decrease"
             elif gain_pixels > loss_pixels * 1.5:
-                dominant_trend = "vegetation_gain"
+                dominant_trend = "increase"
             else:
                 dominant_trend = "stable_mixed"
 
-            # Mean delta of changed pixels
-            loss_mean_delta = float(np.nanmean(delta[loss_cleaned])) if np.any(loss_cleaned) else 0.0
-            gain_mean_delta = float(np.nanmean(delta[gain_cleaned])) if np.any(gain_cleaned) else 0.0
-
             change_vis_stats = {
-                "loss_pixels": loss_pixels,
-                "gain_pixels": gain_pixels,
+                "decrease_pixels": loss_pixels,
+                "increase_pixels": gain_pixels,
                 "stable_pixels": stable_pixels,
-                "nodata_pixels": nodata_pixels,
-                "loss_area_km2": round(loss_area_km2, 2),
-                "gain_area_km2": round(gain_area_km2, 2),
-                "stable_area_km2": round(stable_area_km2, 2),
-                "total_analyzed_km2": round(total_analyzed_km2, 2),
+                "decrease_area_km2": round(loss_area_km2, 2),
+                "increase_area_km2": round(gain_area_km2, 2),
+                "total_analyzed_km2": round(change_result_obj.total_area_sq_meters / 1e6, 2),
                 "dominant_trend": dominant_trend,
-                "loss_mean_delta": round(loss_mean_delta, 4),
-                "gain_mean_delta": round(gain_mean_delta, 4),
-                "threshold": round(threshold, 4),
-                "total_valid_pixels": total_valid_pixels,
-                "num_loss_regions": n_loss,
-                "num_gain_regions": n_gain,
+                "threshold": change_result_obj.parameters.get("threshold"),
+                "total_valid_pixels": change_result_obj.total_pixels,
+                "num_regions": change_result_obj.num_regions,
             }
 
-            # --- Difference visualization (for the Difference mode, not Change Mask) ---
+            # Difference visualization (sparse — only significant pixels colored)
+            delta = t2_aligned - t1_aligned
+            valid_vis = ~np.isnan(t1_aligned) & ~np.isnan(t2_aligned)
+            threshold_vis = change_result_obj.parameters.get("threshold") or 0.12
             diff_clipped = np.clip(np.nan_to_num(delta, nan=0.0), -0.5, 0.5)
             diff_norm = ((diff_clipped + 0.5) / 1.0 * 255).astype(np.uint8)
-            diff_img = np.zeros((min_h, min_w, 4), dtype=np.uint8)
-            sig_mask = valid & (np.abs(np.nan_to_num(delta, nan=0.0)) >= threshold)
+            diff_img = np.zeros((*delta.shape, 4), dtype=np.uint8)
+            sig_mask = valid_vis & (np.abs(np.nan_to_num(delta, nan=0.0)) >= threshold_vis)
             diff_img[sig_mask, 0] = np.where(delta[sig_mask] > 0, diff_norm[sig_mask], 80)
             diff_img[sig_mask, 1] = 50
             diff_img[sig_mask, 2] = np.where(delta[sig_mask] < 0, diff_norm[sig_mask], 80)
             diff_img[sig_mask, 3] = 160
-            diff_img[~valid] = [13, 23, 17, 255]
+            diff_img[~valid_vis] = [13, 23, 17, 255]
             diff_vis_b64 = _encode_rgba_png(diff_img)
 
+            processing_steps.append({
+                "step": "change_detection",
+                "detail": (
+                    f"algorithm={change_result_obj.algorithm}, "
+                    f"changed={change_result_obj.changed_pixels}/{change_result_obj.total_pixels} "
+                    f"({change_result_obj.changed_pct}%), "
+                    f"regions={change_result_obj.num_regions}, "
+                    f"threshold={change_result_obj.parameters.get('threshold')}"
+                ),
+            })
+
             logger.info(
-                "[%s] Change mask: loss=%d px (%.2f km2), gain=%d px (%.2f km2), trend=%s, threshold=%.3f",
-                index_name, loss_pixels, loss_area_km2, gain_pixels, gain_area_km2,
-                dominant_trend, threshold,
+                "[%s] Change detection: %d/%d pixels changed (%.2f%%), %d regions, algorithm=%s",
+                index_name, change_result_obj.changed_pixels, change_result_obj.total_pixels,
+                change_result_obj.changed_pct, change_result_obj.num_regions, change_result_obj.algorithm,
             )
+
         except Exception as e:
-            logger.warning("[%s] Change mask generation failed: %s", index_name, e, exc_info=True)
+            logger.error("Change detection failed: %s", e, exc_info=True)
+            processing_steps.append({
+                "step": "change_detection",
+                "detail": f"FAILED: {type(e).__name__}: {str(e)[:200]}",
+            })
+            change_result = None
+
 
     # ── Step 6: Compute metrics ───────────────────────────────────
     metrics = {}
@@ -2096,6 +2607,176 @@ def run_temporal_comparison(
         "index_description": _INDEX_DEFINITIONS.get(index_name, {}).description if index_name in _INDEX_DEFINITIONS else "",
     }
 
+    # ── Fix undefined ensemble_stats ──────────────────────────────
+    ensemble_stats = None
+
+    # ── E2E Diagnostic Report ──────────────────────────────────────
+    _print_e2e_diagnostic(
+        query=plan.get("query", plan.get("aoi", "unknown")),
+        phenomenon=phenomenon,
+        index_name=index_name,
+        period1=period1,
+        period2=period2,
+        scene_sel_t1=selection_t1,
+        scene_sel_t2=selection_t2,
+        scene_sel_obj_t1=scene_sel_t1,
+        scene_sel_obj_t2=scene_sel_t2,
+        index_t1=index_t1,
+        index_t2=index_t2,
+        analysis_grid_info=analysis_grid_info,
+        scl_available=scl_available,
+        cloud_mask_t1=cloud_mask_t1,
+        cloud_mask_t2=cloud_mask_t2,
+        t1_aligned=t1_aligned,
+        t2_aligned=t2_aligned,
+        change_result_obj=change_result_obj,
+        change_result=change_result,
+        bbox=bbox,
+        multi_signal_enabled=multi_signal_enabled,
+        signal_rules=signal_rules,
+        min_agreeing=min_agreeing,
+        collection=collection,
+        sensor=sensor,
+    )
+
+    # ── Build processing provenance ────────────────────────────
+    # Captures Sentinel Hub / Copernicus research patterns actually implemented
+    stackstac_used_t1 = (index_t1.method == "stackstac") if index_t1 else False
+    stackstac_used_t2 = (index_t2.method == "stackstac") if index_t2 else False
+    n_scenes_t1 = len(selection_t1.scenes) if selection_t1 and selection_t1.scenes else 0
+    n_scenes_t2 = len(selection_t2.scenes) if selection_t2 and selection_t2.scenes else 0
+    scene_ids_t1 = [s.item_id for s in selection_t1.scenes] if selection_t1 and selection_t1.scenes else []
+    scene_ids_t2 = [s.item_id for s in selection_t2.scenes] if selection_t2 and selection_t2.scenes else []
+    is_composite_t1 = stackstac_used_t1 and n_scenes_t1 > 1
+    is_composite_t2 = stackstac_used_t2 and n_scenes_t2 > 1
+
+    # Extract bands_used from index definitions
+    bands_used = {}
+    if _INDEX_BAND_MAP and _INDEX_DEFINITIONS:
+        band_key = (sensor, index_name)
+        bands_used = _INDEX_BAND_MAP.get(band_key, {})
+
+    # Extract acquisition dates from scene selections
+    acq_dates_t1 = [s.datetime for s in selection_t1.scenes] if selection_t1 and selection_t1.scenes else []
+    acq_dates_t2 = [s.datetime for s in selection_t2.scenes] if selection_t2 and selection_t2.scenes else []
+    cloud_covers_t1 = [s.cloud_cover for s in selection_t1.scenes] if selection_t1 and selection_t1.scenes else []
+    cloud_covers_t2 = [s.cloud_cover for s in selection_t2.scenes] if selection_t2 and selection_t2.scenes else []
+
+    # Extract platform/instrument from scene selections
+    platform_t1 = selection_t1.platform if selection_t1 else "unknown"
+    platform_t2 = selection_t2.platform if selection_t2 else "unknown"
+
+    provenance = {
+        "query": {
+            "text": plan.get("query", ""),
+            "phenomenon": phenomenon,
+            "aoi_name": aoi_name,
+            "aoi_bbox": bbox,
+            "period_1": f"{start_date} to {end_date}",
+            "period_2": f"{start_date} to {end_date}",
+        },
+        "dataset": {
+            "provider": "planetary_computer",
+            "collection": collection,
+            "platform": {"period_1": platform_t1, "period_2": platform_t2},
+            "instrument": "MSI" if "sentinel" in collection.lower() else "OLI",
+            "processing_level": "L2A" if "l2a" in collection.lower() else "unknown",
+        },
+        "scenes": {
+            "period_1": {
+                "scene_ids": scene_ids_t1,
+                "acquisition_dates": acq_dates_t1,
+                "cloud_cover": cloud_covers_t1,
+                "count": n_scenes_t1,
+                "aoi_coverage": scene_sel_obj_t1.coverage_ratio if scene_sel_obj_t1 and hasattr(scene_sel_obj_t1, 'coverage_ratio') else None,
+            },
+            "period_2": {
+                "scene_ids": scene_ids_t2,
+                "acquisition_dates": acq_dates_t2,
+                "cloud_cover": cloud_covers_t2,
+                "count": n_scenes_t2,
+                "aoi_coverage": scene_sel_obj_t2.coverage_ratio if scene_sel_obj_t2 and hasattr(scene_sel_obj_t2, 'coverage_ratio') else None,
+            },
+        },
+        "quality_method": {
+            "name": "SCL categorical masking" if scl_available else "nodata-only masking",
+            "source": "Sentinel-2 Scene Classification Layer (Copernicus S2 L2A)",
+            "resampling": "nearest-neighbor" if scl_available else "N/A",
+            "cloud_classes": [3, 8, 9, 10] if scl_available else [],
+            "shadow_class": 3 if scl_available else None,
+            "valid_classes": [4, 5, 6, 7, 11] if scl_available else [],
+            "scl_reprojected": scl_available,
+            "implementation": "compositor.py:create_cloud_mask()",
+        },
+        "composite_method": {
+            "name": "median" if is_composite_t1 else ("single mosaic" if n_scenes_t1 <= 1 else "single mosaic"),
+            "description": (
+                f"Median composite across {n_scenes_t1} observations (StackSTAC)" if is_composite_t1
+                else f"{n_scenes_t1} scene(s), {'StackSTAC mosaic' if stackstac_used_t1 else 'manual rasterio mosaic'}, no temporal composite"
+            ),
+            "observation_count": {
+                "period_1": n_scenes_t1,
+                "period_2": n_scenes_t2,
+            },
+            "scene_ids": {
+                "period_1": scene_ids_t1,
+                "period_2": scene_ids_t2,
+            },
+            "date_range": {
+                "period_1": f"{start_date} to {end_date}",
+                "period_2": f"{start_date} to {end_date}",
+            },
+            "is_composite": {
+                "period_1": is_composite_t1,
+                "period_2": is_composite_t2,
+            },
+            "implementation": (
+                "stackstac_adapter.py:stackstac_compute_index()" if stackstac_used_t1
+                else "mosaic.py:mosaic_bands()"
+            ),
+        },
+        "indices": {
+            "primary": index_name,
+            "supporting": [r.get("index_name") for r in signal_rules if r.get("index_name") != index_name] if signal_rules else [],
+            "formulas": {name: _INDEX_DEFINITIONS[name].formula for name in [index_name] + [r.get("index_name") for r in signal_rules if r.get("index_name") != index_name] if _INDEX_DEFINITIONS and name in _INDEX_DEFINITIONS} if _INDEX_DEFINITIONS else {},
+            "bands": bands_used,
+            "sensor": sensor,
+        },
+        "detector": {
+            "method": change_result_obj.algorithm if change_result_obj else "N/A",
+            "thresholds": change_result_obj.parameters if change_result_obj else {},
+            "min_region_pixels": change_result_obj.parameters.get("min_region_size", 0) if change_result_obj else 0,
+            "min_region_area_m2": (change_result_obj.parameters.get("min_region_size", 0) * (analysis_resolution ** 2)) if change_result_obj and analysis_resolution else 0,
+        },
+        "grid": {
+            "crs": analysis_crs if 'analysis_crs' in dir() else "N/A",
+            "resolution_m": analysis_resolution if 'analysis_resolution' in dir() else 0,
+            "shape": list(t1_aligned.shape) if t1_aligned is not None else [],
+            "pixel_area_m2": (analysis_resolution ** 2) if 'analysis_resolution' in dir() else 0,
+            "transform": str(analysis_transform) if 'analysis_transform' in dir() and analysis_transform else "N/A",
+            "bounds": list(analysis_grid_info.get("bounds", [])) if analysis_grid_info else [],
+            "reprojection_method": "bilinear" if 'analysis_crs' in dir() else "N/A",
+        },
+        "results": {
+            "valid_pixel_count": change_result_obj.total_pixels if change_result_obj else 0,
+            "changed_pixel_count": change_result_obj.changed_pixels if change_result_obj else 0,
+            "changed_area_m2": change_result_obj.changed_area_sq_meters if change_result_obj else 0,
+            "changed_area_ha": (change_result_obj.changed_area_sq_meters / 10000.0) if change_result_obj else 0,
+            "changed_area_km2": (change_result_obj.changed_area_sq_meters / 1e6) if change_result_obj else 0,
+            "changed_pct": change_result_obj.changed_pct if change_result_obj else 0,
+            "region_count": change_result_obj.num_regions if change_result_obj else 0,
+            "pixel_area_m2": (analysis_resolution ** 2) if 'analysis_resolution' in dir() else 0,
+            "area_calculation": f"{change_result_obj.changed_pixels} pixels x {(analysis_resolution ** 2):.1f} m2/pixel = {change_result_obj.changed_area_sq_meters:.0f} m2" if change_result_obj and 'analysis_resolution' in dir() else "N/A",
+        },
+        "implementation_sources": {
+            "quality_masking": "Sentinel Hub Custom Scripts: SCL-based cloudless mosaics pattern",
+            "indices": "Sentinel Hub Custom Scripts: NDVI/NDBI formulas; Copernicus S2 L2A band definitions",
+            "compositing": "StackSTAC: median temporal composite; Sentinel Hub: first-quartile cloud-free pattern",
+            "change_detection": "OrbitalQuery: phenomenon-aware threshold + morphological refinement",
+            "visualization": "OrbitalQuery: RGBA change mask overlay",
+        },
+    }
+
     # ── Build final result ────────────────────────────────────────
     return TemporalComparisonResult(
         status="ok",
@@ -2122,5 +2803,6 @@ def run_temporal_comparison(
         imagery=imagery,
         processing_steps=processing_steps,
         sensor_info=sensor_info,
+        provenance=provenance,
         explanation=explanation,
     )

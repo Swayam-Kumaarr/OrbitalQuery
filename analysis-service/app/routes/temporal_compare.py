@@ -47,6 +47,7 @@ class TemporalCompareRequest(BaseModel):
     sensor: Optional[str] = Field(None, description="Override preferred sensor")
     analysis_type: Optional[str] = Field(None, description="Override analysis type")
     cloud_threshold: Optional[int] = Field(None, ge=0, le=100, description="Override cloud threshold")
+    change_detection_method: Optional[str] = Field(None, description="Override change detection method (phenomenon_aware_difference, cva, object_based)")
 
 
 class TemporalCompareResponse(BaseModel):
@@ -99,6 +100,8 @@ async def temporal_compare(req: TemporalCompareRequest) -> TemporalCompareRespon
         overrides["analysis_type"] = req.analysis_type
     if req.cloud_threshold is not None:
         overrides["cloud_threshold"] = req.cloud_threshold
+    if req.change_detection_method is not None:
+        overrides["change_detection_method"] = req.change_detection_method
 
     plan_result = build_analysis_plan(req.query, overrides or None)
 
@@ -167,6 +170,7 @@ async def temporal_compare(req: TemporalCompareRequest) -> TemporalCompareRespon
             "imagery": result.imagery,
             "processing_steps": result.processing_steps,
             "sensor_info": result.sensor_info,
+            "provenance": result.provenance,
             "explanation": result.explanation,
         }
 

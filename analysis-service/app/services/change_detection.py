@@ -98,11 +98,11 @@ PHENOMENON_CONFIG: dict[str, dict[str, Any]] = {
     "urban_expansion": {
         "index": "NDBI",
         "threshold": 0.12,
-        "min_region_pixels": 25,
+        "min_region_pixels": 25,  # ~0.25 ha at 10m — allows small urban patches
         "direction": "increase",
-        "multi_signal": True,  # use NDBI + NDVI
-        "ndvi_decrease_threshold": 0.10,
-        "description": "Candidate built-up change regions (NDBI increase + optional NDVI decrease)",
+        "multi_signal": True,  # require BOTH NDBI increase AND NDVI decrease
+        "ndvi_decrease_threshold": 0.08,
+        "description": "Candidate built-up change regions (NDBI increase AND NDVI decrease)",
     },
     "vegetation_change": {
         "index": "NDVI",
@@ -281,10 +281,13 @@ def align_rasters(
     target_shape: Optional[tuple[int, int]] = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """
-    Align two rasters to a common grid.
+    Validate that two rasters are on a common grid.
 
     If shapes already match, returns as-is.
-    If shapes differ, crops/resamples both to the minimum common shape.
+    If shapes differ and both transforms are provided but differ,
+    raises ValueError — geographic correspondence cannot be guaranteed.
+    If shapes differ and no transforms are provided, allows min-shape
+    crop ONLY with an explicit warning that correspondence is not guaranteed.
 
     Returns:
         (aligned_baseline, aligned_comparison, alignment_info)
@@ -300,18 +303,36 @@ def align_rasters(
         info["aligned_shape"] = list(baseline.shape)
         return baseline, comparison, info
 
-    # Crop to minimum common dimensions
+    # Shapes differ — check if geographic metadata confirms they should differ
+    both_transforms_present = baseline_transform is not None and comparison_transform is not None
+    if both_transforms_present and baseline_transform != comparison_transform:
+        # Different transforms AND different shapes = arrays are NOT on the same grid.
+        # Silently cropping would compare unrelated pixels.
+        raise ValueError(
+            f"Rasters have different shapes ({baseline.shape} vs {comparison.shape}) "
+            f"AND different transforms. Geographic correspondence cannot be guaranteed. "
+            f"Caller must reproject to a common grid before calling run_change_detection()."
+        )
+
+    # Shapes differ but transforms are the same (or unavailable) — allow min-shape crop
+    # with explicit logging that correspondence is not verified.
     if target_shape:
         h, w = target_shape
     else:
         h = min(baseline.shape[0], comparison.shape[0])
         w = min(baseline.shape[1], comparison.shape[1])
 
+    logger.warning(
+        "Rasters have different shapes (%s vs %s) — cropping to min-shape (%d, %d). "
+        "Geographic correspondence NOT guaranteed. Consider reprojecting to a common grid.",
+        baseline.shape, comparison.shape, h, w,
+    )
+
     aligned_b = baseline[:h, :w]
     aligned_c = comparison[:h, :w]
 
     info["aligned"] = True
-    info["method"] = "crop_to_common"
+    info["method"] = "crop_to_common_warning"
     info["aligned_shape"] = [h, w]
 
     return aligned_b, aligned_c, info
@@ -488,6 +509,16 @@ def extract_regions(
             transform, resolution_meters,
         )
 
+        # Geographic centroid (lat/lon) from rasterio transform
+        centroid_geographic = None
+        if transform is not None:
+            try:
+                from rasterio.transform import xy as _rio_xy
+                geo_xy = _rio_xy(transform, centroid_row, centroid_col)
+                centroid_geographic = [round(geo_xy[1], 8), round(geo_xy[0], 8)]  # [lat, lon]
+            except Exception:
+                pass
+
         regions.append(ChangeRegion(
             region_id=i,
             area_pixels=area_pixels,
@@ -568,16 +599,47 @@ def build_geojson(
     aoi_bbox: list[float],
     index_name: str,
     algorithm: str,
+    # Extended provenance for region evidence
+    threshold: Optional[float] = None,
+    ndvi_threshold: Optional[float] = None,
+    phenomenon: Optional[str] = None,
+    baseline_date: str = "",
+    comparison_date: str = "",
+    crs: str = "EPSG:4326",
+    resolution_meters: float = 10.0,
+    scene_ids: Optional[list[str]] = None,
+    collection: str = "",
+    # Full provenance fields
+    supporting_indices: Optional[list[str]] = None,
+    indicator_formulas: Optional[dict[str, str]] = None,
+    quality_mask: str = "",
+    scl_usage: str = "",
+    cloud_shadow_handling: str = "",
+    composite_method: str = "",
+    observation_count: Optional[dict[str, int]] = None,
+    provider: str = "",
+    platform: str = "",
+    instrument: str = "",
+    processing_level: str = "",
+    acquisition_dates: Optional[list[str]] = None,
+    cloud_cover: Optional[list[float]] = None,
+    aoi_coverage: Optional[float] = None,
+    transform: Any = None,
 ) -> dict[str, Any]:
     """
     Build a GeoJSON FeatureCollection from detected change regions.
 
     Each region becomes a Feature with a Polygon geometry and
-    properties containing the region's statistics.
+    properties containing the region's full evidence chain.
     """
     features = []
+    pixel_area = resolution_meters ** 2
 
     for region in regions:
+        # Compute derived area values
+        area_ha = region.area_sq_meters / 10000.0
+        area_km2 = region.area_sq_meters / 1e6
+
         feature = {
             "type": "Feature",
             "geometry": {
@@ -585,17 +647,69 @@ def build_geojson(
                 "coordinates": region.polygon_coords,
             },
             "properties": {
+                # Region identification
                 "region_id": region.region_id,
+                "direction": region.direction,
+                # Area
                 "area_pixels": region.area_pixels,
                 "area_sq_meters": round(region.area_sq_meters, 2),
+                "area_ha": round(area_ha, 4),
+                "area_km2": round(area_km2, 6),
+                # Signal values
                 "mean_delta": round(region.mean_delta, 4),
                 "max_delta": round(region.max_delta, 4),
                 "min_delta": round(region.min_delta, 4),
-                "direction": region.direction,
+                # Primary indicator
+                "primary_indicator": index_name,
                 "index_name": index_name,
+                # Supporting indicators
+                "supporting_indicators": supporting_indices or [],
+                "indicator_formulas": indicator_formulas or {},
+                # Method
                 "algorithm": algorithm,
+                "threshold": threshold,
+                "ndvi_threshold": ndvi_threshold,
+                # Period
+                "period_1": baseline_date,
+                "period_2": comparison_date,
+                # Dataset
+                "collection": collection,
+                "provider": provider,
+                "platform": platform,
+                "instrument": instrument,
+                "processing_level": processing_level,
+                "crs": crs,
+                "resolution_meters": resolution_meters,
+                "pixel_area_m2": round(pixel_area, 2),
+                # Scene provenance
+                "scene_ids": scene_ids or [],
+                "acquisition_dates": acquisition_dates or [],
+                "cloud_cover": cloud_cover or [],
+                "aoi_coverage": aoi_coverage,
+                # Quality
+                "quality_mask": quality_mask,
+                "scl_usage": scl_usage,
+                "cloud_shadow_handling": cloud_shadow_handling,
+                "composite_method": composite_method,
+                "observation_count": observation_count or {},
+                # Phenomenon
+                "phenomenon": phenomenon,
+                # Centroid (pixel + geographic)
+                "centroid_pixel": [round(region.centroid[0], 6), round(region.centroid[1], 6)] if region.centroid else None,
+                "centroid": None,  # Will be computed below if transform available
+                # Area calculation formula
+                "area_calculation": f"{region.area_pixels} pixels x {pixel_area:.1f} m2/pixel = {region.area_sq_meters:.0f} m2",
             },
         }
+
+        # Compute geographic centroid from transform
+        if transform is not None and region.centroid:
+            try:
+                from rasterio.transform import xy as _rio_xy
+                geo_xy = _rio_xy(transform, region.centroid[0], region.centroid[1])
+                feature["properties"]["centroid"] = [round(geo_xy[1], 8), round(geo_xy[0], 8)]  # [lat, lon]
+            except Exception:
+                pass
         features.append(feature)
 
     return {
@@ -606,6 +720,9 @@ def build_geojson(
             "num_regions": len(regions),
             "index_name": index_name,
             "algorithm": algorithm,
+            "phenomenon": phenomenon,
+            "crs": crs,
+            "resolution_meters": resolution_meters,
         },
     }
 
@@ -742,6 +859,26 @@ def run_change_detection(
     # Multi-signal support
     ndvi_baseline: Optional[np.ndarray] = None,
     ndvi_comparison: Optional[np.ndarray] = None,
+    # Explicit thresholds from the analysis plan (override PHENOMENON_CONFIG)
+    ndbi_threshold: Optional[float] = None,
+    ndvi_decrease_threshold: Optional[float] = None,
+    # Full provenance passthrough
+    scene_ids: Optional[list[str]] = None,
+    collection: str = "",
+    supporting_indices: Optional[list[str]] = None,
+    indicator_formulas: Optional[dict[str, str]] = None,
+    quality_mask: str = "",
+    scl_usage: str = "",
+    cloud_shadow_handling: str = "",
+    composite_method: str = "",
+    observation_count: Optional[dict[str, int]] = None,
+    provider: str = "",
+    platform: str = "",
+    instrument: str = "",
+    processing_level: str = "",
+    acquisition_dates: Optional[list[str]] = None,
+    cloud_cover: Optional[list[float]] = None,
+    aoi_coverage: Optional[float] = None,
 ) -> ChangeDetectionResult:
     """
     Full change detection pipeline.
@@ -765,7 +902,8 @@ def run_change_detection(
 
     # ── Step 0: Load phenomenon config ──────────────────────────
     config = PHENOMENON_CONFIG.get(phenomenon, DEFAULT_CONFIG) if phenomenon else DEFAULT_CONFIG
-    effective_threshold = threshold if threshold is not None else config["threshold"]
+    # Threshold priority: explicit threshold param > ndbi_threshold param > PHENOMENON_CONFIG
+    effective_threshold = threshold if threshold is not None else (ndbi_threshold if ndbi_threshold is not None else config["threshold"])
     effective_min_size = min_region_size if min_region_size is not None else config["min_region_pixels"]
     effective_direction = direction if direction is not None else config["direction"]
 
@@ -855,26 +993,35 @@ def run_change_detection(
     })
 
     # ── Step 6: Multi-signal combination (urban expansion) ──────
+    # Use explicit threshold from plan if provided, else fall back to PHENOMENON_CONFIG
+    effective_ndvi_threshold = ndvi_decrease_threshold if ndvi_decrease_threshold is not None else config.get("ndvi_decrease_threshold", 0.08)
     if config.get("multi_signal") and ndvi_baseline is not None and ndvi_comparison is not None:
         ndvi_diff = ndvi_comparison - ndvi_baseline
-        ndvi_decrease = valid_mask & (ndvi_diff < -config.get("ndvi_decrease_threshold", 0.10))
+        ndvi_threshold = effective_ndvi_threshold
+        ndvi_decrease = valid_mask & (ndvi_diff < -ndvi_threshold)
 
-        # Combine: NDBI increase AND (optional) NDVI decrease
-        combined = raw_change_mask.copy()
-        # Keep pixels where NDBI increased
-        # Additionally mark pixels where both NDBI increased and NDVI decreased
-        # as higher confidence
-        dual_signal = raw_change_mask & (ndvi_diff < 0)  # NDBI up, NDVI down
-        combined = raw_change_mask | dual_signal
+        # Multi-signal: use NDBI as primary, NDVI as region-level validator.
+        # Pixel-level AND is too restrictive because NDBI and NDVI use different
+        # bands and their spatial patterns dont perfectly overlap at 10m resolution.
+        # Strategy: detect NDBI changes, then validate each region against NDVI.
+        # A region is kept if NDVI decrease exists ANYWHERE within it.
+        ndbi_only_count = int(np.sum(raw_change_mask))
+        ndvi_support_count = int(np.sum(ndvi_decrease))
+        overlap_count = int(np.sum(raw_change_mask & ndvi_decrease))
+
+        # Store NDVI support mask for region-level filtering after morphology
+        _ndvi_support_mask = ndvi_decrease
+        _ndvi_threshold_used = ndvi_threshold
 
         processing_steps.append({
             "step": "multi_signal",
             "detail": (
-                f"Combined NDBI increase with NDVI decrease signal. "
-                f"Dual-signal pixels: {int(np.sum(dual_signal))}"
+                f"Region-level validation: NDBI increase ({ndbi_only_count} px), "
+                f"NDVI decrease ({ndvi_support_count} px), "
+                f"overlap ({overlap_count} px). "
+                f"Regions validated against NDVI support after morphology."
             ),
         })
-        raw_change_mask = combined
 
     # ── Step 7: Morphological cleanup ───────────────────────────
     cleaned_mask, num_regions = morphological_cleanup(
@@ -891,7 +1038,34 @@ def run_change_detection(
         ),
     })
 
-    # ── Step 8: Connected components + region extraction ────────
+    # ── Step 8: Region-level multi-signal validation ──────────
+    # For urban expansion: validate each region against NDVI support.
+    # A region is kept if NDVI decrease exists ANYWHERE within it.
+    if config.get("multi_signal") and '_ndvi_support_mask' in dir():
+        labeled_raw, num_raw = ndimage.label(cleaned_mask)
+        validated_mask = np.zeros_like(cleaned_mask)
+        kept_regions = 0
+        removed_regions = 0
+        for region_id in range(1, num_raw + 1):
+            region_mask = labeled_raw == region_id
+            # Check if NDVI decrease exists anywhere in this region
+            ndvi_support_in_region = np.any(_ndvi_support_mask & region_mask)
+            if ndvi_support_in_region:
+                validated_mask[region_mask] = True
+                kept_regions += 1
+            else:
+                removed_regions += 1
+        cleaned_mask = validated_mask
+        num_regions = kept_regions
+        processing_steps.append({
+            "step": "region_ndvi_validation",
+            "detail": (
+                f"Kept {kept_regions} regions with NDVI support, "
+                f"removed {removed_regions} regions without NDVI decrease"
+            ),
+        })
+
+    # ── Step 9: Connected components + region extraction ────────
     labeled, _ = ndimage.label(cleaned_mask)
 
     regions = extract_regions(
@@ -922,7 +1096,31 @@ def run_change_detection(
 
     # ── Step 9: GeoJSON ─────────────────────────────────────────
     change_geojson = build_geojson(
-        regions, aoi_bbox, index_name, config.get("algorithm", "difference_threshold"),
+        regions, aoi_bbox, index_name, algorithm="phenomenon_aware_difference",
+        threshold=effective_threshold,
+        ndvi_threshold=effective_ndvi_threshold,
+        phenomenon=phenomenon,
+        baseline_date=baseline_date,
+        comparison_date=comparison_date,
+        crs=crs,
+        resolution_meters=resolution_meters,
+        scene_ids=scene_ids or [],
+        collection=collection,
+        supporting_indices=supporting_indices,
+        indicator_formulas=indicator_formulas,
+        quality_mask=quality_mask,
+        scl_usage=scl_usage,
+        cloud_shadow_handling=cloud_shadow_handling,
+        composite_method=composite_method,
+        observation_count=observation_count,
+        provider=provider,
+        platform=platform,
+        instrument=instrument,
+        processing_level=processing_level,
+        acquisition_dates=acquisition_dates,
+        cloud_cover=cloud_cover,
+        aoi_coverage=aoi_coverage,
+        transform=baseline_transform,
     )
 
     processing_steps.append({
@@ -973,6 +1171,7 @@ def run_change_detection(
             "direction": effective_direction,
             "phenomenon": phenomenon,
             "multi_signal": config.get("multi_signal", False),
+            "ndvi_decrease_threshold": effective_ndvi_threshold,
         },
         baseline_date=baseline_date,
         comparison_date=comparison_date,

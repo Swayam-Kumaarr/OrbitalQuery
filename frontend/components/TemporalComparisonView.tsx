@@ -425,11 +425,12 @@ function ProcessingPipeline({ steps }: { steps: Array<{ step: string; detail: st
 }
 
 // ══════════════════════════════════════════════════════════════
-// ── Change Mask View (single full-width map) ────────────────
+// ── Change Mask View — GeoJSON-primary with sparse PNG ──────
 // ══════════════════════════════════════════════════════════════
 function ChangeMaskView({
   bbox, sceneT1, sceneT2, thumbnailT1, thumbnailT2, sceneBboxT1, sceneBboxT2,
   changeMaskB64, changeVisBbox, changeVisStats, config, tilejsonUrl1, tilejsonUrl2,
+  changeGeojson, regions,
 }: {
   bbox: number[];
   sceneT1: SceneInfo | null; sceneT2: SceneInfo | null;
@@ -441,10 +442,18 @@ function ChangeMaskView({
   config: { color: string; label: string; indexLabel: string };
   tilejsonUrl1?: string;
   tilejsonUrl2?: string;
+  changeGeojson?: any;
+  regions?: Array<{ region_id: number; area_pixels: number; area_sq_meters: number; direction: string; mean_delta: number; bbox: number[]; centroid: number[] }>;
 }) {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapRefInst = useRef<any>(null);
   const [loading, setLoading] = useState(true);
+  const [selectedRegion, setSelectedRegion] = useState<any>(null);
+
+  // Derive labels from phenomenon (not hardcoded to vegetation)
+  const isUrban = config.label.toLowerCase().includes('urban');
+  const decreaseLabel = isUrban ? 'Built-up Decrease' : 'Decrease';
+  const increaseLabel = isUrban ? 'Built-up Increase' : 'Increase';
 
   useEffect(() => {
     if (!mapRef.current || mapRefInst.current) return;
@@ -453,7 +462,6 @@ function ChangeMaskView({
     import('leaflet').then(async (L) => {
       if (cancelled || !mapRef.current) return;
 
-      // Fetch TileJSON to get correct bounds
       async function fetchTilejson(url: string): Promise<{ tileTemplate: string; bounds: number[] } | null> {
         try {
           const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
@@ -480,18 +488,12 @@ function ChangeMaskView({
       const map = L.map(mapRef.current, { center, zoom: initZoom, zoomControl: false, attributionControl: false });
       L.tileLayer(GOOGLE_TILE, { maxZoom: 22, subdomains: ['0', '1', '2', '3'] }).addTo(map);
 
-      // Load satellite tiles for context
-      const result = await loadSatelliteTiles(map, {
-        L,
-        signedTileUrl: tileUrl1,
-        tilejsonUrl: tilejsonUrl1,
-        sceneCollection: sceneT1?.collection,
-        sceneItemId: sceneT1?.item_id,
+      const satResult = await loadSatelliteTiles(map, {
+        L, signedTileUrl: tileUrl1, tilejsonUrl: tilejsonUrl1,
+        sceneCollection: sceneT1?.collection, sceneItemId: sceneT1?.item_id,
         thumbnailUrl: thumbnailT1,
         sceneBbox: tj1?.bounds?.length === 4 ? tj1.bounds : sceneBboxT1,
-        aoiBbox: bbox,
-        opacity: 0.4,  // dimmed — the change mask is the focus
-        zIndex: 300,
+        aoiBbox: bbox, opacity: 0.5, zIndex: 300,
       });
 
       if (cancelled) return;
@@ -501,110 +503,102 @@ function ChangeMaskView({
       const aoiBounds = boundsToLatLng(bbox);
       L.rectangle(aoiBounds, { color: '#22d3ee', weight: 1, fillColor: '#22d3ee', fillOpacity: 0.02, dashArray: '6 3' }).addTo(map);
 
-      map.fitBounds(result.bounds, { padding: [20, 20] });
-      setTimeout(() => map.invalidateSize(), 100);
+      // ── Render GeoJSON regions as Leaflet polygons ──────────
+      if (changeGeojson?.features?.length > 0) {
+        changeGeojson.features.forEach((feature: any) => {
+          const coords = feature.geometry?.coordinates;
+          const props = feature.properties || {};
+          if (!coords || coords.length === 0) return;
 
+          // GeoJSON Polygon coordinates are [lng, lat] pairs
+          // Leaflet expects [[lat, lng], ...]
+          const latLngs = coords[0].map((c: number[]) => [c[1], c[0]] as [number, number]);
+
+          const dir = props.direction || 'unknown';
+          const isIncrease = dir === 'increase';
+          const fillColor = isIncrease ? '#22B45A' : '#DC3C3C';
+          const fillOpacity = 0.5;
+
+          const polygon = L.polygon(latLngs, {
+            color: fillColor,
+            weight: 2,
+            fillColor: fillColor,
+            fillOpacity,
+            opacity: 0.9,
+          }).addTo(map);
+
+          // Region label
+          const regionLabel = `#${props.region_id || '?'} — ${(props.area_sq_meters / 10000).toFixed(1)} ha — ${dir}`;
+          polygon.bindTooltip(regionLabel, { className: 'oq-tooltip' });
+
+          // Click to show region details with full provenance
+          polygon.on('click', () => {
+            setSelectedRegion({
+              region_id: props.region_id,
+              direction: dir,
+              area_pixels: props.area_pixels,
+              area_sq_meters: props.area_sq_meters,
+              area_ha: (props.area_sq_meters / 10000).toFixed(2),
+              area_km2: ((props.area_sq_meters || 0) / 1e6).toFixed(6),
+              mean_delta: props.mean_delta,
+              max_delta: props.max_delta,
+              min_delta: props.min_delta,
+              index_name: props.index_name,
+              algorithm: props.algorithm,
+              threshold: props.threshold,
+              ndvi_threshold: props.ndvi_threshold,
+              phenomenon: props.phenomenon,
+              period_1: props.period_1,
+              period_2: props.period_2,
+              collection: props.collection,
+              provider: props.provider,
+              platform: props.platform,
+              instrument: props.instrument,
+              processing_level: props.processing_level,
+              crs: props.crs,
+              resolution_meters: props.resolution_meters,
+              pixel_area_m2: props.pixel_area_m2,
+              scene_ids: props.scene_ids,
+              centroid: props.centroid,
+              area_calculation: props.area_calculation,
+              supporting_indicators: props.supporting_indicators,
+              quality_mask: props.quality_mask,
+              composite_method: props.composite_method,
+            });
+          });
+        });
+      }
+
+      map.fitBounds(satResult.bounds, { padding: [20, 20] });
+      setTimeout(() => map.invalidateSize(), 100);
       mapRefInst.current = map;
     });
 
     return () => { cancelled = true; mapRefInst.current?.remove(); mapRefInst.current = null; };
   }, [bbox, thumbnailT1, sceneBboxT1]);
 
-  // Decode and overlay the change mask
-  const decodeVis = (hex: string | null): string | null => {
-    if (!hex) return null;
-    try {
-      const bytes = new Uint8Array(hex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
-      return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
-    } catch { return null; }
-  };
+  // ── Metrics from GeoJSON regions (source of truth) ──────────
+  const regionList = regions || changeGeojson?.features?.map((f: any) => f.properties) || [];
+  const numRegions = regionList.length;
+  const totalRegionAreaSqM = regionList.reduce((sum: number, r: any) => sum + (r.area_sq_meters || 0), 0);
+  const totalRegionAreaKm2 = totalRegionAreaSqM / 1e6;
+  const decreaseRegions = regionList.filter((r: any) => r.direction === 'decrease');
+  const increaseRegions = regionList.filter((r: any) => r.direction === 'increase');
+  const decreaseAreaSqM = decreaseRegions.reduce((s: number, r: any) => s + (r.area_sq_meters || 0), 0);
+  const increaseAreaSqM = increaseRegions.reduce((s: number, r: any) => s + (r.area_sq_meters || 0), 0);
+  const decreaseAreaKm2 = decreaseAreaSqM / 1e6;
+  const increaseAreaKm2 = increaseAreaSqM / 1e6;
+  const threshold = changeVisStats.threshold ?? changeGeojson?.properties?.threshold ?? 0.15;
+  const totalAnalyzed = changeVisStats.total_analyzed_km2 ?? totalRegionAreaKm2;
 
-  const changeMaskUrl = decodeVis(changeMaskB64);
-  const visBbox = changeVisBbox || bbox;
-  const visBoundsStr = `${visBbox[1]},${visBbox[0]},${visBbox[3]},${visBbox[2]}`;
+  const dominantTrend = decreaseAreaSqM > increaseAreaSqM * 1.5 ? 'decrease'
+    : increaseAreaSqM > decreaseAreaSqM * 1.5 ? 'increase' : 'stable_mixed';
 
-  const overlayRef = useRef<any>(null);
-  useEffect(() => {
-    if (!mapRefInst.current || !changeMaskUrl) return;
-    const map = mapRefInst.current;
-    if (overlayRef.current) {
-      map.removeLayer(overlayRef.current);
-      overlayRef.current = null;
-    }
-    const bounds: [[number, number], [number, number]] = [[visBbox[1], visBbox[0]], [visBbox[3], visBbox[2]]];
-    import('leaflet').then((L) => {
-      const leaflet = (L as any).default || L;
-      const img = leaflet.imageOverlay(changeMaskUrl, bounds as any, { opacity: 0.85, zIndex: 500 }).addTo(map);
-      overlayRef.current = img;
-    });
-    return () => { if (overlayRef.current) { map.removeLayer(overlayRef.current); overlayRef.current = null; } };
-  }, [changeMaskUrl, visBoundsStr]);
-
-  // Stats from backend — with client-side fallback when backend stats are 0
-  const backendLossPixels = changeVisStats.loss_pixels ?? 0;
-  const backendGainPixels = changeVisStats.gain_pixels ?? 0;
-  const backendHasStats = backendLossPixels > 0 || backendGainPixels > 0;
-  const [clientStatsLoading, setClientStatsLoading] = useState(false);
-
-  // Client-side stat computation from the mask PNG (fallback)
-  const [clientStats, setClientStats] = useState<{ lossPixels: number; gainPixels: number } | null>(null);
-  useEffect(() => {
-    if (backendHasStats || !changeMaskB64) { setClientStats(null); setClientStatsLoading(false); return; }
-    setClientStatsLoading(true);
-    try {
-      const bytes = new Uint8Array(changeMaskB64.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
-      createImageBitmap(new Blob([bytes], { type: 'image/png' })).then(bitmap => {
-        const canvas = document.createElement('canvas');
-        canvas.width = bitmap.width;
-        canvas.height = bitmap.height;
-        const ctx = canvas.getContext('2d')!;
-        ctx.drawImage(bitmap, 0, 0);
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const d = imgData.data;
-        let loss = 0, gain = 0;
-        // Detect loss/gain pixels with wide thresholds to handle PNG compression artifacts
-        // Loss: warm tones (red/orange/brown) — R dominant, G low-ish
-        // Gain: green tones — G dominant, R low-ish
-        for (let i = 0; i < d.length; i += 4) {
-          const [r, g, b, a] = [d[i], d[i+1], d[i+2], d[i+3]];
-          if (a < 50) continue; // skip fully transparent
-          // Loss: R > 140, R > G + 40, R > B + 40 (covers red, orange, brown)
-          if (r > 140 && r > g + 40 && r > b + 40) { loss++; continue; }
-          // Gain: G > 100, G > R + 30, G > B + 20 (covers green, teal)
-          if (g > 100 && g > r + 30 && g > b + 20) { gain++; }
-        }
-        setClientStats({ lossPixels: loss, gainPixels: gain });
-        setClientStatsLoading(false);
-        bitmap.close();
-      }).catch(() => { setClientStatsLoading(false); });
-    } catch { setClientStatsLoading(false); }
-  }, [changeMaskB64, backendHasStats]);
-
-  // Use backend stats if available AND non-zero, otherwise fall back to client-side counts
-  const resolutionM = changeVisStats.resolution_m ?? 10;
-  const pixelAreaKm2 = (resolutionM * resolutionM) / 1e6;
-
-  const lossPixels = backendHasStats ? backendLossPixels : (clientStats?.lossPixels ?? 0);
-  const gainPixels = backendHasStats ? backendGainPixels : (clientStats?.gainPixels ?? 0);
-
-  // Always compute area from actual pixel counts — never trust backend area when pixels are 0
-  const lossKm2 = parseFloat((lossPixels * pixelAreaKm2).toFixed(2));
-  const gainKm2 = parseFloat((gainPixels * pixelAreaKm2).toFixed(2));
-
-  const dominantTrend = changeVisStats.dominant_trend ??
-    (lossPixels > gainPixels * 1.5 ? 'vegetation_loss' : gainPixels > lossPixels * 1.5 ? 'vegetation_gain' : 'stable_mixed');
-  const threshold = changeVisStats.threshold ?? 0.15;
-  const numLossRegions = changeVisStats.num_loss_regions ?? 0;
-  const numGainRegions = changeVisStats.num_gain_regions ?? 0;
-  const stablePixels = changeVisStats.stable_pixels ?? 0;
-  const totalAnalyzed = changeVisStats.total_analyzed_km2 ?? parseFloat(((lossPixels + gainPixels + stablePixels) * pixelAreaKm2).toFixed(2));
-
-  const trendLabel = dominantTrend === 'vegetation_loss' ? 'VEGETATION LOSS'
-    : dominantTrend === 'vegetation_gain' ? 'VEGETATION GAIN'
+  const trendLabel = dominantTrend === 'decrease' ? `${decreaseLabel.toUpperCase()} DOMINANT`
+    : dominantTrend === 'increase' ? `${increaseLabel.toUpperCase()} DOMINANT`
     : 'STABLE / MIXED';
-  const trendColor = dominantTrend === 'vegetation_loss' ? '#DC3C3C'
-    : dominantTrend === 'vegetation_gain' ? '#22B45A'
-    : '#9CA3AF';
+  const trendColor = dominantTrend === 'decrease' ? '#DC3C3C'
+    : dominantTrend === 'increase' ? '#22B45A' : '#9CA3AF';
 
   return (
     <div className="relative">
@@ -614,39 +608,97 @@ function ChangeMaskView({
 
         {/* Title badge */}
         <div className="absolute top-3 left-3 z-[1000] px-3 py-1 rounded bg-oq-950/85 backdrop-blur-sm border border-oq-700/30">
-          <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: '#10B981' }}>Change Detection</span>
-          <span className="text-[8px] text-oq-300 ml-2">{config.indexLabel}-based categorical mask</span>
+          <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: '#10B981' }}>Change Regions</span>
+          <span className="text-[8px] text-oq-300 ml-2">{config.indexLabel}-based detection / {numRegions} regions</span>
         </div>
 
-        {/* Legend */}
+        {/* Legend — phenomenon-aware labels */}
         <div className="absolute top-3 right-12 z-[1000] bg-oq-950/85 backdrop-blur-sm rounded border border-oq-700/30 px-3 py-2">
           <div className="text-[7px] uppercase tracking-wider mb-1.5 font-medium" style={{ color: '#9CA3AF' }}>Legend</div>
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-sm" style={{ background: 'rgba(220,60,60,0.85)' }} />
-              <span className="text-[9px] font-medium" style={{ color: '#E5E7EB' }}>Loss ({lossPixels.toLocaleString()} px / {lossKm2} km²)</span>
+              <span className="text-[9px] font-medium" style={{ color: '#E5E7EB' }}>{decreaseLabel} ({decreaseRegions.length} regions / {decreaseAreaKm2.toFixed(2)} km²)</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-sm" style={{ background: 'rgba(34,180,90,0.85)' }} />
-              <span className="text-[9px] font-medium" style={{ color: '#E5E7EB' }}>Gain ({gainPixels.toLocaleString()} px / {gainKm2} km²)</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-sm" style={{ background: 'rgba(15,22,18,0.6)', border: '1px solid rgba(42,58,47,0.5)' }} />
-              <span className="text-[9px] font-medium" style={{ color: '#9CA3AF' }}>Stable</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-sm" style={{ background: 'rgba(20,28,24,1)' }} />
-              <span className="text-[9px] font-medium" style={{ color: '#68756E' }}>No Data</span>
+              <span className="text-[9px] font-medium" style={{ color: '#E5E7EB' }}>{increaseLabel} ({increaseRegions.length} regions / {increaseAreaKm2.toFixed(2)} km²)</span>
             </div>
           </div>
         </div>
+
+        {/* Selected region popup — full provenance */}
+        {selectedRegion && (
+          <div className="absolute bottom-14 left-3 z-[1000] bg-oq-950/95 backdrop-blur-sm rounded border border-oq-700/30 px-3 py-2.5 max-w-[320px] max-h-[400px] overflow-y-auto">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[10px] font-bold" style={{ color: selectedRegion.direction === 'increase' ? '#22B45A' : '#DC3C3C' }}>
+                Region {String(selectedRegion.region_id).padStart(2, '0')}
+              </span>
+              <button onClick={() => setSelectedRegion(null)} className="text-oq-400 hover:text-white text-[10px]">x</button>
+            </div>
+            <div className="text-[8px] text-oq-200 space-y-1">
+              {/* Location */}
+              <div className="text-[9px] font-semibold text-oq-100 uppercase tracking-wider">Location & Area</div>
+              <div>Area: {selectedRegion.area_ha} ha ({selectedRegion.area_km2} km²)</div>
+              <div>Pixels: {selectedRegion.area_pixels}</div>
+              {selectedRegion.area_calculation && <div className="text-oq-400">{selectedRegion.area_calculation}</div>}
+              {selectedRegion.centroid && <div>Centroid: [{selectedRegion.centroid.map((c: number) => c.toFixed(4)).join(', ')}]</div>}
+
+              {/* Signal */}
+              <div className="text-[9px] font-semibold text-oq-100 uppercase tracking-wider pt-1">Signal</div>
+              <div>Primary: {selectedRegion.index_name} ({selectedRegion.direction})</div>
+              {selectedRegion.mean_delta != null && <div>Mean Δ: {selectedRegion.mean_delta.toFixed(4)}</div>}
+              {selectedRegion.max_delta != null && <div>Max Δ: {selectedRegion.max_delta.toFixed(4)}</div>}
+              {selectedRegion.supporting_indicators && selectedRegion.supporting_indicators.length > 0 && (
+                <div>Supporting: {selectedRegion.supporting_indicators.join(', ')}</div>
+              )}
+
+              {/* Period */}
+              <div className="text-[9px] font-semibold text-oq-100 uppercase tracking-wider pt-1">Period</div>
+              <div>Baseline: {selectedRegion.period_1 || '—'}</div>
+              <div>Comparison: {selectedRegion.period_2 || '—'}</div>
+
+              {/* Dataset */}
+              <div className="text-[9px] font-semibold text-oq-100 uppercase tracking-wider pt-1">Dataset</div>
+              <div>Collection: {selectedRegion.collection || '—'}</div>
+              {selectedRegion.provider && <div>Provider: {selectedRegion.provider}</div>}
+              {selectedRegion.platform && <div>Platform: {selectedRegion.platform}</div>}
+
+              {/* Method */}
+              <div className="text-[9px] font-semibold text-oq-100 uppercase tracking-wider pt-1">Method</div>
+              <div>Algorithm: {selectedRegion.algorithm || '—'}</div>
+              <div>Threshold: {selectedRegion.threshold != null ? selectedRegion.threshold : '—'}</div>
+              {selectedRegion.resolution_meters && <div>Resolution: {selectedRegion.resolution_meters}m</div>}
+              {selectedRegion.crs && <div>CRS: {selectedRegion.crs}</div>}
+
+              {/* Scene IDs */}
+              {selectedRegion.scene_ids && selectedRegion.scene_ids.length > 0 && (
+                <>
+                  <div className="text-[9px] font-semibold text-oq-100 uppercase tracking-wider pt-1">Scenes</div>
+                  {selectedRegion.scene_ids.map((sid: string, idx: number) => (
+                    <div key={idx} className="text-oq-400 font-mono truncate">{sid}</div>
+                  ))}
+                </>
+              )}
+
+              {/* Quality */}
+              {selectedRegion.quality_mask && (
+                <>
+                  <div className="text-[9px] font-semibold text-oq-100 uppercase tracking-wider pt-1">Quality</div>
+                  <div>Mask: {selectedRegion.quality_mask}</div>
+                  {selectedRegion.composite_method && <div>Composite: {selectedRegion.composite_method}</div>}
+                </>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Loading */}
         {loading && (
           <div className="absolute inset-0 z-[1000] flex items-center justify-center bg-oq-950/60">
             <div className="flex items-center gap-2 px-3 py-1.5 rounded bg-oq-900/90 border border-oq-700/30">
               <svg className="animate-spin h-3 w-3 text-lime" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
-              <span className="text-[9px] text-oq-200">Loading change mask...</span>
+              <span className="text-[9px] text-oq-200">Loading change regions...</span>
             </div>
           </div>
         )}
@@ -659,38 +711,36 @@ function ChangeMaskView({
         </div>
       </div>
 
-      {/* Change statistics bar below map */}
+      {/* Change statistics bar — derived from GeoJSON regions */}
       <div className="mt-3 flex items-stretch gap-3">
         {/* Dominant trend */}
         <div className="flex-shrink-0 px-4 py-3 rounded-lg border border-oq-700/20 bg-oq-800/20">
           <div className="text-[8px] uppercase tracking-wider mb-1" style={{ color: '#9CA3AF' }}>Dominant Trend</div>
           <div className="text-[15px] font-bold tracking-tight" style={{ color: trendColor }}>{trendLabel}</div>
         </div>
-        {/* Loss */}
+        {/* Decrease */}
         <div className="flex-1 px-4 py-3 rounded-lg border border-oq-700/20 bg-oq-800/20">
           <div className="flex items-center gap-1.5 mb-1">
             <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#DC3C3C' }} />
-            <span className="text-[8px] uppercase tracking-wider" style={{ color: '#9CA3AF' }}>Vegetation Loss</span>
+            <span className="text-[8px] uppercase tracking-wider" style={{ color: '#9CA3AF' }}>{decreaseLabel}</span>
           </div>
-          <div className="text-[18px] font-bold leading-none" style={{ color: '#DC3C3C' }}>{lossKm2} km²</div>
-          <div className="text-[9px] mt-0.5 font-mono" style={{ color: '#68756E' }}>{lossPixels.toLocaleString()} pixels / {numLossRegions} regions</div>
+          <div className="text-[18px] font-bold leading-none" style={{ color: '#DC3C3C' }}>{decreaseAreaKm2.toFixed(2)} km²</div>
+          <div className="text-[9px] mt-0.5 font-mono" style={{ color: '#68756E' }}>{decreaseRegions.length} regions</div>
         </div>
-        {/* Gain */}
+        {/* Increase */}
         <div className="flex-1 px-4 py-3 rounded-lg border border-oq-700/20 bg-oq-800/20">
           <div className="flex items-center gap-1.5 mb-1">
             <span className="w-1.5 h-1.5 rounded-full" style={{ background: '#22B45A' }} />
-            <span className="text-[8px] uppercase tracking-wider" style={{ color: '#9CA3AF' }}>Vegetation Gain</span>
+            <span className="text-[8px] uppercase tracking-wider" style={{ color: '#9CA3AF' }}>{increaseLabel}</span>
           </div>
-          <div className="text-[18px] font-bold leading-none" style={{ color: '#22B45A' }}>{gainKm2} km²</div>
-          <div className="text-[9px] mt-0.5 font-mono" style={{ color: '#68756E' }}>{gainPixels.toLocaleString()} pixels / {numGainRegions} regions</div>
+          <div className="text-[18px] font-bold leading-none" style={{ color: '#22B45A' }}>{increaseAreaKm2.toFixed(2)} km²</div>
+          <div className="text-[9px] mt-0.5 font-mono" style={{ color: '#68756E' }}>{increaseRegions.length} regions</div>
         </div>
-        {/* Net */}
+        {/* Total */}
         <div className="flex-1 px-4 py-3 rounded-lg border border-oq-700/20 bg-oq-800/20">
-          <div className="text-[8px] uppercase tracking-wider mb-1" style={{ color: '#9CA3AF' }}>Net Change</div>
-          <div className="text-[18px] font-bold leading-none" style={{ color: '#FFFFFF' }}>
-            {lossKm2 > gainKm2 ? '-' : '+'}{Math.abs(lossKm2 - gainKm2).toFixed(2)} km²
-          </div>
-          <div className="text-[9px] mt-0.5 font-mono" style={{ color: '#68756E' }}>analyzed: {totalAnalyzed.toFixed(1)} km² / threshold: {threshold.toFixed(3)}</div>
+          <div className="text-[8px] uppercase tracking-wider mb-1" style={{ color: '#9CA3AF' }}>Total Regions</div>
+          <div className="text-[18px] font-bold leading-none" style={{ color: '#FFFFFF' }}>{numRegions}</div>
+          <div className="text-[9px] mt-0.5 font-mono" style={{ color: '#68756E' }}>{totalRegionAreaKm2.toFixed(2)} km² total / threshold: {typeof threshold === 'number' ? threshold.toFixed(3) : threshold}</div>
         </div>
       </div>
     </div>
@@ -707,34 +757,28 @@ function AnnualTrendChart({ result, config }: { result: TemporalComparisonResult
 
   const meanT1 = t1.stats?.mean ?? 0;
   const meanT2 = t2.stats?.mean ?? 0;
-  const changedArea = (result.metrics?.changed_area_km2 as number) || 0;
+  const dateT1 = result.scene_t1?.datetime ? new Date(result.scene_t1.datetime).getFullYear() : 0;
+  const dateT2 = result.scene_t2?.datetime ? new Date(result.scene_t2.datetime).getFullYear() : 0;
+  if (!dateT1 || !dateT2) return null;
 
-  const dateT1 = result.scene_t1?.datetime ? new Date(result.scene_t1.datetime).getFullYear() : 2021;
-  const dateT2 = result.scene_t2?.datetime ? new Date(result.scene_t2.datetime).getFullYear() : 2025;
-
-  const years: number[] = [];
-  for (let y = dateT1; y <= dateT2; y++) years.push(y);
-  if (years.length < 2) return null;
-
-  const trendData = years.map((year, i) => {
-    const t = years.length > 1 ? i / (years.length - 1) : 0;
-    const indexVal = meanT1 + (meanT2 - meanT1) * t;
-    const areaKm2 = Math.abs(changedArea) * t;
-    return { year: String(year), index: parseFloat(indexVal.toFixed(4)), area: parseFloat(areaKm2.toFixed(1)) };
-  });
+  // ONLY real observations — no interpolation between years
+  const trendData = [
+    { year: String(dateT1), index: parseFloat(meanT1.toFixed(4)), area: 0 },
+    { year: String(dateT2), index: parseFloat(meanT2.toFixed(4)), area: parseFloat(((result.metrics?.changed_area_km2 as number) || 0).toFixed(1)) },
+  ];
 
   return (
     <details className="rounded-lg border border-oq-700/15 bg-oq-800/15 overflow-hidden group" open>
       <summary className="px-4 py-2.5 text-[10px] font-semibold text-oq-200 uppercase tracking-wider cursor-pointer hover:text-oq-50 transition-colors flex items-center justify-between">
         <span className="flex items-center gap-1.5">
           <svg className="w-3 h-3 text-oq-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z" /></svg>
-          Annual Trend ({dateT1} - {dateT2})
+          Observed Change ({dateT1} → {dateT2})
         </span>
         <svg className="w-3.5 h-3.5 text-oq-300 group-open:rotate-180 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </summary>
       <div className="px-4 pb-4">
         <div className="mb-2">
-          <span className="text-[9px] text-oq-300">Interpolated trend between {dateT1} and {dateT2} observations</span>
+          <span className="text-[9px] text-oq-300">Two measured observations — values between are NOT interpolated</span>
         </div>
         <RechartsTrendChart data={trendData} indexLabel={config.indexLabel} />
       </div>
@@ -762,16 +806,42 @@ export default function TemporalComparisonView({ result }: Props) {
   const changedPixels = result.change_detection?.changed_pixels || result.change_detection?.changedPixels || 0;
   const totalPixels = result.change_detection?.total_pixels || 0;
 
-  // Format direction as trend label
+  // Format direction as trend label — phenomenon-aware
   const trendLabel = (() => {
     if (!direction || direction === 'N/A') return null;
-    const map: Record<string, string> = {
-      expansion: 'URBAN EXPANSION', increase: 'INCREASE', loss: 'LOSS', decrease: 'DECREASE',
-      flooding: 'FLOODING', shrinking: 'SHRINKING', retreat: 'GLACIER RETREAT',
-      erosion: 'EROSION', burned: 'BURN DAMAGE', drier: 'DROUGHT', wetter: 'WETTING',
-      stable: 'STABLE', accretion: 'ACCRETION', gain: 'VEGETATION GAIN',
+    const phenomenon = result.phenomenon || '';
+    // Phenomenon-specific direction labels
+    // NEVER show vegetation labels for urban queries
+    if (phenomenon === 'urban_expansion') {
+      const urbanMap: Record<string, string> = {
+        increase: 'DETECTED URBAN CHANGE', decrease: 'URBAN DECREASE', mixed: 'MIXED URBAN SIGNAL',
+      };
+      return urbanMap[direction] || direction.toUpperCase();
+    }
+    if (phenomenon === 'vegetation_change' || phenomenon === 'deforestation') {
+      const vegMap: Record<string, string> = {
+        increase: 'VEGETATION GAIN', decrease: 'VEGETATION LOSS', mixed: 'MIXED SIGNAL',
+      };
+      return vegMap[direction] || direction.toUpperCase();
+    }
+    if (phenomenon === 'water_change' || phenomenon === 'flood_impact') {
+      const waterMap: Record<string, string> = {
+        increase: 'WATER EXPANSION', decrease: 'WATER SHRINKING', mixed: 'MIXED SIGNAL',
+      };
+      return waterMap[direction] || direction.toUpperCase();
+    }
+    if (phenomenon === 'burn_severity') {
+      const burnMap: Record<string, string> = {
+        decrease: 'BURN DAMAGE', increase: 'RECOVERY', mixed: 'MIXED SIGNAL',
+      };
+      return burnMap[direction] || direction.toUpperCase();
+    }
+    // Generic fallback
+    const genericMap: Record<string, string> = {
+      increase: 'INCREASE', decrease: 'DECREASE', mixed: 'MIXED SIGNAL',
+      stable: 'STABLE',
     };
-    return map[direction] || direction.toUpperCase();
+    return genericMap[direction] || direction.toUpperCase();
   })();
 
   // ── Has valid imagery? ───────────────────────────────────
@@ -862,6 +932,8 @@ export default function TemporalComparisonView({ result }: Props) {
               config={config}
               tilejsonUrl1={result.imagery?.period1?.tilejson as string}
               tilejsonUrl2={result.imagery?.period2?.tilejson as string}
+              changeGeojson={result.change_visualizations?.change_geojson || result.change_detection?.change_geojson}
+              regions={result.change_visualizations?.regions || result.change_detection?.regions}
             />
           )}
 
@@ -1068,6 +1140,123 @@ export default function TemporalComparisonView({ result }: Props) {
             </div>
           </details>
         )}
+
+        {/* ── 6. Provenance Trace (query → pixel → region) ─── */}
+        {(() => {
+          const prov = result.provenance;
+          const consistency = result.change_detection?.consistency_validation;
+          if (!prov && !consistency) return null;
+          return (
+            <details className="rounded-lg border border-oq-700/15 bg-oq-800/15 overflow-hidden group">
+              <summary className="px-4 py-2.5 text-[10px] font-semibold text-oq-200 uppercase tracking-wider cursor-pointer hover:text-oq-50 transition-colors flex items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <svg className="w-3 h-3 text-oq-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
+                  Full Provenance
+                </span>
+                <svg className="w-3.5 h-3.5 text-oq-300 group-open:rotate-180 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
+              </summary>
+              <div className="px-4 pb-3 space-y-3">
+                {prov && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {/* Query */}
+                    <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                      <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1">Query</div>
+                      <div className="text-[10px] text-oq-100">{prov.query?.text || '—'}</div>
+                      <div className="text-[9px] text-oq-300 mt-0.5">Phenomenon: {prov.query?.phenomenon || '—'}</div>
+                    </div>
+                    {/* Dataset */}
+                    {prov.dataset && (
+                      <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                        <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1">Dataset</div>
+                        <div className="text-[10px] text-oq-100">{prov.dataset.provider} / {prov.dataset.collection}</div>
+                        <div className="text-[9px] text-oq-300 mt-0.5">{prov.dataset.instrument} · {prov.dataset.processing_level}</div>
+                      </div>
+                    )}
+                    {/* Grid */}
+                    {prov.grid && prov.grid.crs && (
+                      <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                        <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1">Analysis Grid</div>
+                        <div className="text-[10px] text-oq-100 font-mono">CRS: {prov.grid.crs}</div>
+                        <div className="text-[9px] text-oq-300 mt-0.5">Resolution: {prov.grid.resolution_m}m · Shape: {prov.grid.shape?.[1]}x{prov.grid.shape?.[0]}</div>
+                        <div className="text-[9px] text-oq-300">Pixel area: {prov.grid.pixel_area_m2} m²</div>
+                        {prov.grid.bounds && prov.grid.bounds.length === 4 && (
+                          <div className="text-[8px] text-oq-400 font-mono mt-0.5">Bounds: [{prov.grid.bounds.map((b: number) => b.toFixed(4)).join(', ')}]</div>
+                        )}
+                        <div className="text-[8px] text-oq-400">Reprojection: {prov.grid.reprojection_method || 'N/A'}</div>
+                      </div>
+                    )}
+                    {/* Detector */}
+                    {prov.detector && (
+                      <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                        <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1">Detector</div>
+                        <div className="text-[10px] text-oq-100">Method: {prov.detector.method}</div>
+                        <div className="text-[9px] text-oq-300 mt-0.5">Min region: {prov.detector.min_region_pixels}px = {prov.detector.min_region_area_m2?.toFixed(0)} m²</div>
+                        {prov.detector.thresholds?.threshold != null && (
+                          <div className="text-[9px] text-oq-300">Threshold: {prov.detector.thresholds.threshold}</div>
+                        )}
+                      </div>
+                    )}
+                    {/* Indices */}
+                    {prov.indices && (
+                      <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                        <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1">Indices</div>
+                        <div className="text-[10px] text-oq-100">Primary: {prov.indices.primary}</div>
+                        {prov.indices.supporting?.length > 0 && (
+                          <div className="text-[9px] text-oq-300">Supporting: {prov.indices.supporting.join(', ')}</div>
+                        )}
+                        {prov.indices.formulas && Object.entries(prov.indices.formulas).map(([name, formula]) => (
+                          <div key={name} className="text-[8px] text-oq-400 font-mono mt-0.5">{name}: {String(formula)}</div>
+                        ))}
+                      </div>
+                    )}
+                    {/* Quality */}
+                    {prov.quality_method && (
+                      <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                        <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1">Quality Mask</div>
+                        <div className="text-[10px] text-oq-100">{prov.quality_method.name}</div>
+                        <div className="text-[9px] text-oq-300 mt-0.5">Resampling: {prov.quality_method.resampling}</div>
+                      </div>
+                    )}
+                    {/* Results */}
+                    {prov.results && (
+                      <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                        <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1">Results</div>
+                        <div className="text-[10px] text-oq-100 font-mono">Changed: {prov.results.changed_pixel_count?.toLocaleString()} / {prov.results.valid_pixel_count?.toLocaleString()} pixels</div>
+                        <div className="text-[10px] text-oq-100">Changed area: {prov.results.changed_area_ha?.toFixed(2)} ha ({prov.results.changed_area_km2?.toFixed(4)} km²)</div>
+                        <div className="text-[9px] text-oq-300 mt-0.5">Regions: {prov.results.region_count}</div>
+                        {prov.results.area_calculation && (
+                          <div className="text-[8px] text-oq-400 font-mono mt-0.5">{prov.results.area_calculation}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {/* Consistency validation */}
+                {consistency && (
+                  <div className="p-2.5 rounded bg-oq-800/20 border border-oq-700/10">
+                    <div className="text-[8px] text-oq-300 uppercase tracking-wider font-medium mb-1.5">Consistency Validation</div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full ${consistency.region_count?.consistent ? 'bg-lime' : 'bg-semantic-error'}`} />
+                        <span className="text-[9px] text-oq-200">
+                          Region count: {consistency.region_count?.consistent ? 'CONSISTENT' : 'MISMATCH'}
+                          {' '}(api={consistency.region_count?.api}, geojson={consistency.region_count?.geojson}, frontend={consistency.region_count?.frontend})
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full ${consistency.area_calculation?.consistent ? 'bg-lime' : 'bg-semantic-error'}`} />
+                        <span className="text-[9px] text-oq-200">
+                          Area calc: {consistency.area_calculation?.consistent ? 'CONSISTENT' : 'MISMATCH'}
+                          {' '}(diff: {consistency.area_calculation?.difference_m2?.toFixed(1)} m²)
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </details>
+          );
+        })()}
       </div>
     </div>
   );

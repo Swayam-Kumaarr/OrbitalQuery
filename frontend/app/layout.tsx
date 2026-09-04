@@ -4,7 +4,7 @@ import MockInitializer from '@/components/MockInitializer';
 
 export const metadata: Metadata = {
   title: 'OrbitalQuery — Semantic EO Dataset Explorer',
-  description: 'Query Earth Observation datasets with natural language, geospatial filters, and time ranges using semantic AI search.',
+  description: 'Query Earth Observation datasets with natural language, geospatial filters, and time ranges using semantic search.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -61,6 +61,49 @@ export interface IndexInfo {
   total_pixels: number;
 }
 
+export interface GeoJsonRegion {
+  region_id: number;
+  area_pixels: number;
+  area_sq_meters: number;
+  area_ha?: number;
+  area_km2?: number;
+  bbox: number[];
+  centroid: number[];
+  centroid_pixel?: number[];
+  mean_delta: number;
+  max_delta: number;
+  min_delta: number;
+  direction: string;
+  primary_indicator?: string;
+  index_name?: string;
+  supporting_indicators?: string[];
+  indicator_formulas?: Record<string, string>;
+  algorithm?: string;
+  threshold?: number | null;
+  ndvi_threshold?: number | null;
+  period_1?: string;
+  period_2?: string;
+  collection?: string;
+  provider?: string;
+  platform?: string;
+  instrument?: string;
+  processing_level?: string;
+  crs?: string;
+  resolution_meters?: number;
+  pixel_area_m2?: number;
+  scene_ids?: string[];
+  acquisition_dates?: string[];
+  cloud_cover?: number[];
+  aoi_coverage?: number | null;
+  quality_mask?: string;
+  scl_usage?: string;
+  composite_method?: string;
+  observation_count?: { period_1?: number; period_2?: number };
+  phenomenon?: string;
+  area_calculation?: string;
+  polygon_coords?: number[][][];
+}
+
 export interface TemporalComparisonResult {
   plan_id: string;
   phenomenon: string;
@@ -74,7 +117,13 @@ export interface TemporalComparisonResult {
   index_t1: IndexInfo | null;
   index_t2: IndexInfo | null;
   change_detection: Record<string, any> | null;
-  change_visualizations: { change_mask_png: string; difference_png: string; bbox: number[] } | null;
+  change_visualizations: {
+    change_mask_png?: string;
+    difference_png?: string;
+    bbox?: number[];
+    change_geojson?: any;
+    regions?: GeoJsonRegion[];
+  } | null;
   metrics: Record<string, any>;
   imagery: {
     period1: Record<string, string>;
@@ -82,6 +131,17 @@ export interface TemporalComparisonResult {
   };
   processing_steps: Array<{ step: string; detail: string }>;
   sensor_info: Record<string, any>;
+  provenance?: {
+    query?: { text: string; phenomenon: string; aoi_name: string; aoi_bbox: number[]; period_1: string; period_2: string };
+    dataset?: { provider: string; collection: string; platform: Record<string, string>; instrument: string; processing_level: string };
+    scenes?: { period_1: { scene_ids: string[]; acquisition_dates: string[]; cloud_cover: number[]; count: number; aoi_coverage: number | null }; period_2: { scene_ids: string[]; acquisition_dates: string[]; cloud_cover: number[]; count: number; aoi_coverage: number | null } };
+    quality_method?: { name: string; source: string; resampling: string; cloud_classes: number[]; scl_reprojected: boolean };
+    composite_method?: { name: string; description: string; observation_count: { period_1: number; period_2: number }; implementation: string };
+    indices?: { primary: string; supporting: string[]; formulas: Record<string, string>; bands: Record<string, string>; sensor: string };
+    detector?: { method: string; thresholds: Record<string, any>; min_region_pixels: number; min_region_area_m2: number };
+    grid?: { crs: string; resolution_m: number; shape: number[]; pixel_area_m2: number; transform: string; bounds: number[]; reprojection_method: string };
+    results?: { valid_pixel_count: number; changed_pixel_count: number; changed_area_m2: number; changed_area_ha: number; changed_area_km2: number; changed_pct: number; region_count: number; pixel_area_m2: number; area_calculation: string };
+  };
   explanation: {
     title: string;
     summary: string;

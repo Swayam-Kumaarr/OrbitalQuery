@@ -1273,12 +1273,20 @@ NASA_CMR_COLLECTIONS: dict[str, dict[str, str]] = {
         "instrument": "MODIS",
         "gsd": 500,
     },
-    # Landsat HLS
+    # Landsat HLS (30m, requires Earthdata Login)
     "landsat-hls": {
         "concept_id": "C2021957657-LPCLOUD",
         "title": "HLS Landsat Surface Reflectance",
         "platform": "Landsat",
         "instrument": "OLI",
+        "gsd": 30,
+    },
+    # Sentinel-2 HLS (30m, requires Earthdata Login)
+    "sentinel2-hls": {
+        "concept_id": "C2021957295-LPCLOUD",
+        "title": "HLS Sentinel-2 Multi-spectral Instrument Surface Reflectance Daily Global 30m v2",
+        "platform": "Sentinel-2",
+        "instrument": "MSI",
         "gsd": 30,
     },
 }
@@ -1439,8 +1447,10 @@ class NASACMRProvider(EOProvider):
             max_bbox_area_deg2=100.0,
             notes=(
                 "NASA Common Metadata Repository. No auth for search. "
-                "Provides MODIS, VIIRS, and Landsat HLS data. "
-                "Uses CMR API (not STAC). Useful for fire, snow, vegetation monitoring."
+                "Provides MODIS, VIIRS, Landsat HLS, and Sentinel-2 HLS data. "
+                "Uses CMR API (not STAC). "
+                "HLS data requires Earthdata Login for asset access. "
+                "Search is public; download requires EARTHDATA_USER/EARTHDATA_PASS."
             ),
         )
 

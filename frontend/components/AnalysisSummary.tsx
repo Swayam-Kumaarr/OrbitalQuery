@@ -59,7 +59,7 @@ export default function AnalysisSummary({ result }: AnalysisSummaryProps) {
 
   if (isAvailable(changedArea) && changedArea > 0) {
     primaryValue = `~${typeof changedArea === 'number' ? changedArea.toLocaleString(undefined, { maximumFractionDigits: 2 }) : changedArea} km²`;
-    primaryLabel = 'estimated change area';
+    primaryLabel = 'changed area';
     primaryAvailable = true;
   } else if (isAvailable(changedPct) && changedPct > 0) {
     primaryValue = `~${typeof changedPct === 'number' ? changedPct.toFixed(1) : changedPct}%`;
@@ -76,7 +76,7 @@ export default function AnalysisSummary({ result }: AnalysisSummaryProps) {
     ? `${formatDate(result.period1.start)} → ${formatDate(result.period2.end)}`
     : '—';
 
-  const confidence = explanation.confidence || 'Preliminary analysis based on available data.';
+  const confidence = explanation.confidence || null;
 
   return (
     <div className="space-y-3">
@@ -169,7 +169,7 @@ export default function AnalysisSummary({ result }: AnalysisSummaryProps) {
           </svg>
         </summary>
         <div className="px-4 pb-3 space-y-3">
-          <p className="text-[11px] text-oq-200 leading-relaxed">{confidence}</p>
+          {confidence && <p className="text-[11px] text-oq-200 leading-relaxed">{confidence}</p>}
           {result.scene_t1 && result.scene_t2 && (
             <div className="grid grid-cols-2 gap-3">
               <div className="p-2.5 rounded-md bg-oq-800/50 border border-oq-700/30">

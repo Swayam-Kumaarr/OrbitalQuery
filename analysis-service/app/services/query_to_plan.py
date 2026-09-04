@@ -804,6 +804,7 @@ def build_analysis_plan(query: str, overrides: Optional[dict[str, Any]] = None) 
             "rules": signal_rules,
             "min_agreeing_signals": semantic_concept.min_agreeing_signals if semantic_concept else 1,
         },
+        "change_detection_method": overrides.get("change_detection_method", "phenomenon_aware_difference"),
         "evidence_requirements": evidence_reqs,
         "trace": trace,
         # ── Validation ────────────────────────────────────────
