@@ -11,6 +11,6 @@ python -m uvicorn app.main:app \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --workers 1 \
-  --limit-concurrency 1 \
-  --timeout-keep-alive 65 \
+  --limit-concurrency 2 \
+  --timeout-keep-alive 300 \
   --log-level info

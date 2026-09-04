@@ -12,7 +12,7 @@ on:
 jobs:
   ping-services:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
     - name: Check secrets are configured
@@ -33,13 +33,14 @@ jobs:
         URL="${PYTHON_URL}/ping"
         echo "Pinging $URL ..."
         for i in 1 2 3; do
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL" || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 "$URL" || echo "000")
           echo "  Attempt $i: HTTP $HTTP_CODE"
           if [ "$HTTP_CODE" = "200" ]; then
             echo "  Analysis service is alive."
             exit 0
           fi
-          sleep 5
+          echo "  Waiting 30s for cold start..."
+          sleep 30
         done
         echo "::warning::Analysis service did not return 200 after 3 attempts. It may be starting up."
         exit 0  # Don't fail the workflow — cold start is expected

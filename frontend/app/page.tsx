@@ -297,8 +297,8 @@ function HomePageContent() {
 
         {/* ── ANALYSIS IN PROGRESS ─────────────────────────── */}
         {step !== 'idle' && step !== 'complete' && step !== 'error' && (
-          <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="w-full px-6 py-4 h-full flex flex-col">
+          <div className="flex-1 flex flex-col overflow-hidden min-h-0">
+              <div className="w-full px-6 py-4 flex-1 flex flex-col min-h-0">
                 {/* Back + query */}
                 <div className="flex items-center justify-between mb-3">
                   <button onClick={analysis.reset} className="flex items-center gap-1.5 text-[11px] text-oq-300 hover:text-lime transition-colors font-medium">
