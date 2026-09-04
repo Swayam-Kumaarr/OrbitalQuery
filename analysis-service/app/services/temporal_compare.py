@@ -2328,7 +2328,7 @@ def run_temporal_comparison(
                 composite_method=_prov_composite,
                 observation_count={"period_1": _prov_n_t1, "period_2": _prov_n_t2},
                 provider="planetary_computer",
-                platform=selection_t1.platform if selection_t1 else "unknown",
+                platform=(selection_t1.scenes[0].platform if selection_t1 and selection_t1.scenes else "unknown"),
                 instrument="MSI" if "sentinel" in collection.lower() else "OLI",
                 processing_level="L2A" if "l2a" in collection.lower() else "unknown",
                 acquisition_dates=_prov_acq_dates_t1 + _prov_acq_dates_t2,
@@ -2661,8 +2661,9 @@ def run_temporal_comparison(
     cloud_covers_t2 = [s.cloud_cover for s in selection_t2.scenes] if selection_t2 and selection_t2.scenes else []
 
     # Extract platform/instrument from scene selections
-    platform_t1 = selection_t1.platform if selection_t1 else "unknown"
-    platform_t2 = selection_t2.platform if selection_t2 else "unknown"
+    # SceneSelectionResult has .sensor not .platform — get platform from first scene
+    platform_t1 = selection_t1.scenes[0].platform if selection_t1 and selection_t1.scenes else "unknown"
+    platform_t2 = selection_t2.scenes[0].platform if selection_t2 and selection_t2.scenes else "unknown"
 
     provenance = {
         "query": {
