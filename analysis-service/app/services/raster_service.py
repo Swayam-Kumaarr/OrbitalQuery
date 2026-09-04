@@ -399,6 +399,13 @@ def determine_common_grid(
     analysis_crs = RCRS.from_user_input(target_crs) if target_crs else rasters[0]["crs"]
     analysis_resolution = rasters[0]["resolution_x"]  # preserve native resolution
 
+    # Memory safety: cap resolution to 20m minimum for Render free tier
+    # At 10m, a Sentinel-2 tile is ~10980x10980 pixels = ~460MB in float32
+    # At 20m, same tile is ~5490x5490 = ~115MB — fits in 512MB
+    if analysis_resolution < 20.0:
+        analysis_resolution = 20.0
+        logger.info("[Memory] Resolution capped to 20m (was %.1fm) for Render free tier", rasters[0]["resolution_x"])
+
     # Transform AOI bbox to analysis CRS
     transformer_to_analysis = Transformer.from_crs(
         RCRS.from_epsg(4326), analysis_crs, always_xy=True
