@@ -30,7 +30,7 @@ jobs:
       env:
         PYTHON_URL: ${{ secrets.PYTHON_SERVICE_URL }}
       run: |
-        URL="${PYTHON_URL}/health"
+        URL="${PYTHON_URL}/ping"
         echo "Pinging $URL ..."
         for i in 1 2 3; do
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL" || echo "000")

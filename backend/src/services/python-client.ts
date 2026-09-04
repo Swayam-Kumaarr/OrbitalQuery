@@ -20,8 +20,8 @@ const PYTHON_SERVICE_TIMEOUT_MS = parseInt(
   10,
 );
 
-const MAX_RETRIES = 1; // Single retry — falls back to local engine if Python is cold
-const RETRY_DELAY_MS = 3000; // Wait 3s then retry once
+const MAX_RETRIES = 1; // One retry — enough for Render cold start with 25s wait
+const RETRY_DELAY_MS = 25000; // 25s wait for Render free tier cold start (service typically wakes in 30-60s)
 
 // ── Types ───────────────────────────────────────────────────────────
 
