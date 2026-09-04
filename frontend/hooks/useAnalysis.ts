@@ -179,8 +179,8 @@ export interface AnalysisState {
 
 // ── Constants ───────────────────────────────────────────────────
 
-/** 90s timeout — Vercel rewrite + Render cold start + analysis processing */
-const FETCH_TIMEOUT_MS = 90_000;
+/** 120s timeout — Vercel rewrite + Render cold start (40s) + retry (2s) + analysis (40s) + overhead */
+const FETCH_TIMEOUT_MS = 120_000;
 
 // ── Helper: single fetch attempt ────────────────────────────────
 
@@ -303,7 +303,7 @@ export function useAnalysis() {
           break;
         } catch (err: any) {
           const wrapped = err instanceof AnalysisError ? err : new AnalysisError(err.message, 'UNKNOWN');
-          const isColdStart = wrapped.code === 'PYTHON_UNAVAILABLE' || wrapped.code === 'HTTP_503' || wrapped.code === 'TIMEOUT';
+          const isColdStart = wrapped.code === 'PYTHON_UNAVAILABLE' || wrapped.code === 'HTTP_503' || wrapped.code === 'TIMEOUT' || wrapped.code === 'UPSTREAM_TIMEOUT' || wrapped.code === 'UPSTREAM_UNAVAILABLE';
           if (attempt === 0 && isColdStart) {
             setState(prev => ({
               ...prev,

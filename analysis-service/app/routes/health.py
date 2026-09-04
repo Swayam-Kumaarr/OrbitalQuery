@@ -13,6 +13,9 @@ from app.config import STAC_API_URL
 
 router = APIRouter(tags=["health"])
 
+# Lightweight start timestamp for fast ping checks
+_start_time = time.time()
+
 
 def _check_stac_reachable(url: str, timeout: int = 5) -> dict:
     """Check if the STAC API is reachable and measure latency."""
@@ -65,6 +68,12 @@ def _check_scipy() -> dict:
         return {"available": True, "version": scipy.__version__}
     except Exception as e:
         return {"available": False, "error": str(e)[:100]}
+
+
+@router.get("/ping")
+async def ping():
+    """Lightweight ping — no heavy imports, no network calls. Used by Express to verify Python is alive."""
+    return {"status": "ok", "uptime_s": round(time.time() - _start_time, 1)}
 
 
 @router.get("/health")

@@ -74,23 +74,50 @@ export async function callPythonService<T = any>(
       });
     };
 
-    let response = await doFetch();
-
-    // Retry on 502/503 (Render cold-start / restart) with exponential backoff
-    let retries = 0;
-    while ((response.status === 502 || response.status === 503) && retries < MAX_RETRIES) {
-      const delay = RETRY_DELAY_MS * Math.pow(2, retries);
-      console.log(`[python-client] ← ${response.status}, retrying in ${delay}ms (attempt ${retries + 1}/${MAX_RETRIES}) | requestId=${requestId}`);
-      await new Promise(r => setTimeout(r, delay));
-      retries++;
+    // Retry loop — handles 502/503 (cold start) AND network/timeout errors
+    let lastError: any = null;
+    let lastResponse: Response | null = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        response = await doFetch();
-      } catch (fetchErr) {
-        // Network error during retry — fall through to catch block below
-        throw fetchErr;
+        const resp = await doFetch();
+        // Retry on 502/503 (Render cold-start)
+        if ((resp.status === 502 || resp.status === 503) && attempt < MAX_RETRIES) {
+          const delay = RETRY_DELAY_MS * Math.pow(2, attempt);
+          console.log(`[python-client] ← ${resp.status}, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES}) | requestId=${requestId}`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        lastResponse = resp;
+        lastError = null;
+        break;
+      } catch (fetchErr: any) {
+        lastError = fetchErr;
+        lastResponse = null;
+        // Retry on network/timeout errors
+        if (attempt < MAX_RETRIES) {
+          const delay = RETRY_DELAY_MS * Math.pow(2, attempt);
+          const errType = fetchErr.name === 'TimeoutError' ? 'TIMEOUT' : 'NETWORK';
+          console.log(`[python-client] ← ${errType} error, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES}) | requestId=${requestId}`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        // All retries exhausted
+        break;
       }
     }
 
+    // Handle network/timeout failure after retries exhausted
+    if (lastError) {
+      const upstreamLatencyMs = Date.now() - start;
+      if (lastError.name === 'TimeoutError' || lastError.code === 'ABORT_ERR') {
+        console.error(`[python-client] ← TIMEOUT after ${effectiveTimeout}ms (${MAX_RETRIES + 1} attempts) | requestId=${requestId}`);
+        return { ok: false, requestId, error: 'Python analysis service timed out after retries', code: 'UPSTREAM_TIMEOUT', upstreamLatencyMs };
+      }
+      console.error(`[python-client] ← NETWORK ERROR: ${lastError.message} (all retries failed) | requestId=${requestId}`);
+      return { ok: false, requestId, error: 'Analysis service is currently unavailable. It may be starting up from sleep — please try again in 30 seconds.', code: 'UPSTREAM_UNAVAILABLE', upstreamLatencyMs };
+    }
+
+    const response = lastResponse!;
     const upstreamLatencyMs = Date.now() - start;
     const text = await response.text();
 
@@ -98,74 +125,21 @@ export async function callPythonService<T = any>(
     try {
       data = JSON.parse(text);
     } catch {
-      // Non-JSON response from Python service (e.g. 502/503 HTML from Render)
-      console.error(
-        `[python-client] ← ${response.status} (non-JSON) | requestId=${requestId} latency=${upstreamLatencyMs}ms`,
-      );
-      return {
-        ok: false,
-        requestId,
-        status: response.status,
-        error: 'Analysis service is starting up. Please try again in 30 seconds.',
-        code: response.status === 503 ? 'HTTP_503' : 'HTTP_502',
-        upstreamLatencyMs,
-      };
+      console.error(`[python-client] ← ${response.status} (non-JSON) | requestId=${requestId} latency=${upstreamLatencyMs}ms`);
+      return { ok: false, requestId, status: response.status, error: 'Analysis service is starting up. Please try again in 30 seconds.', code: response.status === 503 ? 'HTTP_503' : 'HTTP_502', upstreamLatencyMs };
     }
 
     if (!response.ok) {
-      // Log but do NOT leak Python tracebacks to frontend
-      console.error(
-        `[python-client] ← ${response.status} | requestId=${requestId} latency=${upstreamLatencyMs}ms error=${data?.detail || 'unknown'}`,
-      );
-      return {
-        ok: false,
-        requestId,
-        status: response.status,
-        error: sanitizeUpstreamError(data),
-        code: mapStatusCode(response.status),
-        upstreamLatencyMs,
-      };
+      console.error(`[python-client] ← ${response.status} | requestId=${requestId} latency=${upstreamLatencyMs}ms error=${data?.detail || 'unknown'}`);
+      return { ok: false, requestId, status: response.status, error: sanitizeUpstreamError(data), code: mapStatusCode(response.status), upstreamLatencyMs };
     }
 
-    console.log(
-      `[python-client] ← ${response.status} OK | requestId=${requestId} latency=${upstreamLatencyMs}ms`,
-    );
-
-    return {
-      ok: true,
-      requestId,
-      status: response.status,
-      data: data as T,
-      upstreamLatencyMs,
-    };
+    console.log(`[python-client] ← ${response.status} OK | requestId=${requestId} latency=${upstreamLatencyMs}ms`);
+    return { ok: true, requestId, status: response.status, data: data as T, upstreamLatencyMs };
   } catch (err: any) {
     const upstreamLatencyMs = Date.now() - start;
-
-    // Timeout
-    if (err.name === 'TimeoutError' || err.code === 'ABORT_ERR') {
-      console.error(
-        `[python-client] ← TIMEOUT after ${effectiveTimeout}ms | requestId=${requestId}`,
-      );
-      return {
-        ok: false,
-        requestId,
-        error: 'Python analysis service timed out',
-        code: 'UPSTREAM_TIMEOUT',
-        upstreamLatencyMs,
-      };
-    }
-
-    // Connection refused / network error
-    console.error(
-      `[python-client] ← NETWORK ERROR: ${err.message} | requestId=${requestId}`,
-    );
-    return {
-      ok: false,
-      requestId,
-      error: 'Analysis service is currently unavailable. It may be starting up from sleep — please try again in 30 seconds.',
-      code: 'UPSTREAM_UNAVAILABLE',
-      upstreamLatencyMs,
-    };
+    console.error(`[python-client] ← FATAL: ${err.message} | requestId=${requestId}`);
+    return { ok: false, requestId, error: 'Analysis service encountered an unexpected error', code: 'UPSTREAM_FATAL', upstreamLatencyMs };
   }
 }
 
@@ -206,8 +180,9 @@ function mapStatusCode(status: number): string {
  */
 export async function checkPythonServiceHealth(): Promise<boolean> {
   try {
-    const res = await fetch(`${PYTHON_SERVICE_URL}/health`, {
-      signal: AbortSignal.timeout(5000),
+    // Use /ping (lightweight, no heavy imports) instead of /health
+    const res = await fetch(`${PYTHON_SERVICE_URL}/ping`, {
+      signal: AbortSignal.timeout(8000),
     });
     return res.ok;
   } catch {
@@ -223,8 +198,9 @@ export async function isPythonServiceUp(): Promise<boolean> {
   // Cache result for 60 seconds to avoid hammering during cold starts
   if (Date.now() - _pythonStatusCache.at < 60_000) return _pythonStatusCache.ok;
   try {
-    const res = await fetch(`${PYTHON_SERVICE_URL}/health`, {
-      signal: AbortSignal.timeout(15000),
+    // Use /ping (lightweight, instant response) instead of /health
+    const res = await fetch(`${PYTHON_SERVICE_URL}/ping`, {
+      signal: AbortSignal.timeout(10000),
     });
     _pythonStatusCache = { ok: res.ok, at: Date.now() };
     return res.ok;
