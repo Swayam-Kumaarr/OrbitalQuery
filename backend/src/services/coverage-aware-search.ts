@@ -291,24 +291,25 @@ async function searchCachedSTAC(
   aoiBbox: BBox,
   request: SearchRequest,
 ): Promise<NormalizedDataset[]> {
-  const now = new Date();
-  const where: any = {
-    expiresAt: { gt: now },
-  };
+  try {
+    const now = new Date();
+    const where: any = {
+      expiresAt: { gt: now },
+    };
 
-  if (request.collection) where.collection = request.collection;
+    if (request.collection) where.collection = request.collection;
 
-  // Spatial filter using centroid
-  const [west, south, east, north] = aoiBbox;
-  where.centroidLng = { gte: west, lte: east };
-  where.centroidLat = { gte: south, lte: north };
+    // Spatial filter using centroid
+    const [west, south, east, north] = aoiBbox;
+    where.centroidLng = { gte: west, lte: east };
+    where.centroidLat = { gte: south, lte: north };
 
-  const rows = await prisma.cachedSTACItem.findMany({
-    where,
-    take: 200,
-  });
+    const rows = await prisma.cachedSTACItem.findMany({
+      where,
+      take: 200,
+    });
 
-  return rows.map((row: any) => ({
+    return rows.map((row: any) => ({
     id: row.stacId,
     provider: row.provider,
     collection: row.collection,
@@ -331,6 +332,11 @@ async function searchCachedSTAC(
       ? { lat: row.centroidLat, lng: row.centroidLng }
       : null,
   }));
+  } catch (e: any) {
+    // Table may not exist yet (migration pending) — return empty
+    console.warn('[search] cached_stac_items table unavailable:', e.message?.substring(0, 100));
+    return [];
+  }
 }
 
 // ── Cache live STAC results ──────────────────────────────────────────
