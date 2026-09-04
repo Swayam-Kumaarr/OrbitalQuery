@@ -2687,14 +2687,14 @@ def run_temporal_comparison(
                 "acquisition_dates": acq_dates_t1,
                 "cloud_cover": cloud_covers_t1,
                 "count": n_scenes_t1,
-                "aoi_coverage": scene_sel_obj_t1.coverage_ratio if scene_sel_obj_t1 and hasattr(scene_sel_obj_t1, 'coverage_ratio') else None,
+                "aoi_coverage": scene_sel_t1.coverage_ratio if scene_sel_t1 and hasattr(scene_sel_t1, 'coverage_ratio') else None,
             },
             "period_2": {
                 "scene_ids": scene_ids_t2,
                 "acquisition_dates": acq_dates_t2,
                 "cloud_cover": cloud_covers_t2,
                 "count": n_scenes_t2,
-                "aoi_coverage": scene_sel_obj_t2.coverage_ratio if scene_sel_obj_t2 and hasattr(scene_sel_obj_t2, 'coverage_ratio') else None,
+                "aoi_coverage": scene_sel_t2.coverage_ratio if scene_sel_t2 and hasattr(scene_sel_t2, 'coverage_ratio') else None,
             },
         },
         "quality_method": {
