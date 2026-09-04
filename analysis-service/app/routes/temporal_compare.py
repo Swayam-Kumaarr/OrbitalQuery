@@ -21,9 +21,12 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+import gc
+
 from app.security import validate_query_safe
 from app.services.temporal_compare import run_temporal_comparison
 from app.services.query_to_plan import build_analysis_plan
+from app.services.memory_guard import check_memory_headroom, get_safe_max_dim
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analysis", tags=["temporal-compare"])
@@ -115,8 +118,27 @@ async def temporal_compare(req: TemporalCompareRequest) -> TemporalCompareRespon
 
     plan = plan_result["plan"]
 
+    # Pre-flight memory check
+    mem_ok, mem_mb, mem_msg = check_memory_headroom(required_mb=150)
+    if not mem_ok:
+        logger.error("[temporal-compare] Insufficient memory: %s", mem_msg)
+        return TemporalCompareResponse(
+            request_id=request_id,
+            status="error",
+            plan=plan,
+            message="Analysis engine has insufficient memory for this request. Try a smaller area or shorter time period.",
+            errors=[mem_msg],
+        )
+
+    # Compute safe max_dim for this run
+    bbox = plan.get("bbox", [0, 0, 0, 0])
+    bbox_area = abs(bbox[2] - bbox[0]) * abs(bbox[3] - bbox[1]) if len(bbox) == 4 else 0.15
+    safe_max_dim = get_safe_max_dim(bbox_area)
+    plan["_safe_max_dim"] = safe_max_dim
+
     # Step 2-8: Run temporal comparison
     try:
+        gc.collect()  # Clean up before heavy work
         result = run_temporal_comparison(plan)
 
         # Serialize result (convert dataclasses to dicts)
@@ -181,7 +203,18 @@ async def temporal_compare(req: TemporalCompareRequest) -> TemporalCompareRespon
             result=result_dict,
         )
 
+    except MemoryError as e:
+        gc.collect()
+        logger.error("[temporal-compare] OOM: %s", e)
+        return TemporalCompareResponse(
+            request_id=request_id,
+            status="error",
+            plan=plan,
+            message="Analysis ran out of memory. Try a smaller area (e.g., a city district instead of full state) or shorter time period.",
+            errors=[f"MemoryError: {str(e)[:200]}"],
+        )
     except Exception as e:
+        gc.collect()
         logger.error("[temporal-compare] Pipeline failed: %s", e, exc_info=True)
         return TemporalCompareResponse(
             request_id=request_id,

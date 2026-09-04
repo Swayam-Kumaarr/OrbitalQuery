@@ -323,7 +323,7 @@ def determine_common_grid(
     href2: str,
     bbox: list[float],
     target_crs: Optional[str] = None,
-    max_dim: int = 1024,
+    max_dim: int = 512,
     auth: Optional[str] = None,
 ) -> dict[str, Any]:
     """

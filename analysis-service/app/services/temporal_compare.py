@@ -2033,8 +2033,9 @@ def run_temporal_comparison(
                             href2 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
 
                     if href1 and href2:
-                        # Determine common analysis grid
-                        analysis_grid_info = determine_common_grid(href1, href2, bbox)
+                        # Determine common analysis grid (use safe_max_dim for memory safety)
+                        safe_max_dim = plan.get("_safe_max_dim", 512)
+                        analysis_grid_info = determine_common_grid(href1, href2, bbox, max_dim=safe_max_dim)
                         analysis_crs = str(analysis_grid_info["crs"])
                         analysis_transform = analysis_grid_info["transform"]
                         analysis_shape = (analysis_grid_info["height"], analysis_grid_info["width"])
