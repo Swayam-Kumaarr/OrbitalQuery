@@ -1298,7 +1298,7 @@ router.post('/temporal-compare', optionalAuth, async (req: AuthRequest, res: Res
   if (cloud_threshold !== undefined) pythonBody.cloud_threshold = cloud_threshold;
 
   const { callPythonService } = await import('../services/python-client');
-  const PYTHON_TIMEOUT = 40000; // 40s per attempt — with 1 retry + 2s delay = 82s total, within frontend 120s timeout
+  const PYTHON_TIMEOUT = 55000; // 55s per attempt — Python analysis takes ~49s on Render free tier. With 1 retry + 25s cold-start wait = 135s worst case (frontend retries once on timeout)
   
   // Call Python directly (no health pre-check — it adds latency and
   // incorrectly skips Python during cold starts)
