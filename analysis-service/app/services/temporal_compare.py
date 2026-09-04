@@ -1906,42 +1906,39 @@ def run_temporal_comparison(
                     logger.error("[%s] Fallback also failed: %s", lbl, e2)
             return None
 
-    # 4a: Compute primary index
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {}
-        if selection_t1.scenes:
-            futures["t1"] = executor.submit(_compute_for_period, selection_t1, "period1")
-        if selection_t2.scenes:
-            futures["t2"] = executor.submit(_compute_for_period, selection_t2, "period2")
+    # 4a: Compute primary index — SEQUENTIALLY to avoid OOM on Render free tier
+    # Running both periods in parallel doubles peak memory usage
+    if selection_t1.scenes:
+        result = _compute_for_period(selection_t1, "period1")
+        index_t1 = result
+        if result:
+            scene_ids = ",".join(s.item_id[:20] for s in selection_t1.scenes[:3])
+            processing_steps.append({
+                "step": "compute_index_t1",
+                "detail": (
+                    f"{index_name} for {scene_ids}: "
+                    f"mean={result.stats['mean']}, "
+                    f"scenes={selection_t1.total_scenes}, "
+                    f"mosaic={selection_t1.is_mosaic}"
+                ),
+            })
+        gc.collect()  # Free memory between periods
 
-        for key, future in futures.items():
-            result = future.result()
-            if key == "t1":
-                index_t1 = result
-                if result:
-                    scene_ids = ",".join(s.item_id[:20] for s in selection_t1.scenes[:3])
-                    processing_steps.append({
-                        "step": "compute_index_t1",
-                        "detail": (
-                            f"{index_name} for {scene_ids}: "
-                            f"mean={result.stats['mean']}, "
-                            f"scenes={selection_t1.total_scenes}, "
-                            f"mosaic={selection_t1.is_mosaic}"
-                        ),
-                    })
-            else:
-                index_t2 = result
-                if result:
-                    scene_ids = ",".join(s.item_id[:20] for s in selection_t2.scenes[:3])
-                    processing_steps.append({
-                        "step": "compute_index_t2",
-                        "detail": (
-                            f"{index_name} for {scene_ids}: "
-                            f"mean={result.stats['mean']}, "
-                            f"scenes={selection_t2.total_scenes}, "
-                            f"mosaic={selection_t2.is_mosaic}"
-                        ),
-                    })
+    if selection_t2.scenes:
+        result = _compute_for_period(selection_t2, "period2")
+        index_t2 = result
+        if result:
+            scene_ids = ",".join(s.item_id[:20] for s in selection_t2.scenes[:3])
+            processing_steps.append({
+                "step": "compute_index_t2",
+                "detail": (
+                    f"{index_name} for {scene_ids}: "
+                    f"mean={result.stats['mean']}, "
+                    f"scenes={selection_t2.total_scenes}, "
+                    f"mosaic={selection_t2.is_mosaic}"
+                ),
+            })
+        gc.collect()  # Free memory after period 2
 
     # Force GC after index computation to free raster memory before change detection
     gc.collect()
@@ -1953,27 +1950,19 @@ def run_temporal_comparison(
         for extra_idx_name in additional_indicator_names:
             extra_t1 = None
             extra_t2 = None
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {}
-                # Use mosaic path when primary index used mosaic — ensures same shape
-                if selection_t1.scenes and len(selection_t1.scenes) > 0:
-                    scene_dicts_t1 = [s.to_dict() for s in selection_t1.scenes]
-                    futures["t1"] = executor.submit(
-                        _compute_index_from_mosaic_scenes,
-                        extra_idx_name, sensor, scene_dicts_t1, bbox, "period1_ndvi",
-                    )
-                if selection_t2.scenes and len(selection_t2.scenes) > 0:
-                    scene_dicts_t2 = [s.to_dict() for s in selection_t2.scenes]
-                    futures["t2"] = executor.submit(
-                        _compute_index_from_mosaic_scenes,
-                        extra_idx_name, sensor, scene_dicts_t2, bbox, "period2_ndvi",
-                    )
-                for key, future in futures.items():
-                    result = future.result()
-                    if key == "t1":
-                        extra_t1 = result
-                    else:
-                        extra_t2 = result
+            # Compute sequentially to avoid OOM on Render free tier
+            if selection_t1.scenes and len(selection_t1.scenes) > 0:
+                scene_dicts_t1 = [s.to_dict() for s in selection_t1.scenes]
+                extra_t1 = _compute_index_from_mosaic_scenes(
+                    extra_idx_name, sensor, scene_dicts_t1, bbox, "period1_ndvi",
+                )
+                gc.collect()
+            if selection_t2.scenes and len(selection_t2.scenes) > 0:
+                scene_dicts_t2 = [s.to_dict() for s in selection_t2.scenes]
+                extra_t2 = _compute_index_from_mosaic_scenes(
+                    extra_idx_name, sensor, scene_dicts_t2, bbox, "period2_ndvi",
+                )
+                gc.collect()
             if extra_t1 or extra_t2:
                 logger.info(
                     "[SHAPE-TRACE] NDVI t1: shape=%s valid=%d t2: shape=%s valid=%d",
