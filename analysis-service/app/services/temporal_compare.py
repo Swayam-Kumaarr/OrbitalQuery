@@ -2154,9 +2154,10 @@ def run_temporal_comparison(
                         from app.services.compositor import create_cloud_mask
                         import rasterio as _rio_scl
 
-                        # Read SCL band from both periods
-                        scl_data_t1 = read_raster_window(scl_href1, bbox, max_dim=1024)
-                        scl_data_t2 = read_raster_window(scl_href2, bbox, max_dim=1024)
+                        # Read SCL band from both periods (use safe max_dim for memory safety)
+                        safe_max_dim = plan.get("_safe_max_dim", 512)
+                        scl_data_t1 = read_raster_window(scl_href1, bbox, max_dim=safe_max_dim)
+                        scl_data_t2 = read_raster_window(scl_href2, bbox, max_dim=safe_max_dim)
                         scl_arr_t1 = scl_data_t1['data']
                         scl_arr_t2 = scl_data_t2['data']
                         if scl_arr_t1.ndim == 3:

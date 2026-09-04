@@ -33,7 +33,7 @@ def mosaic_bands(
     scene_hrefs: list[str],
     band_names: list[str],
     bbox: list[float],
-    max_dim: int = 1024,
+    max_dim: int = 512,
 ) -> dict[str, Any]:
     """
     Mosaic multiple scenes into one composite for the given AOI.

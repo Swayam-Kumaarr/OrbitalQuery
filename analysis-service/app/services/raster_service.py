@@ -28,7 +28,7 @@ def read_raster_window(
     Read a small raster window for a given bounding box.
 
     Uses aggressive memory limits to stay under 512MB on Render free tier.
-    max_dim=1024 → 1024² float32 = 4MB per band (safe).
+    max_dim=512 → 512² float32 = 1MB per band (safe for Render free tier 512MB).
 
     Args:
         href: URL or path to raster file
