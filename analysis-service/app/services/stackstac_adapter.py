@@ -35,7 +35,7 @@ def stackstac_mosaic(
     resolution: float = 20.0,
     epsg: int = 32643,
     max_dim: Optional[int] = None,
-    dtype: str = "float64",
+    dtype: str = "float32",
 ) -> dict[str, Any]:
     """
     Create a mosaicked composite from multiple STAC items using StackSTAC.
@@ -297,14 +297,14 @@ def stackstac_compute_index(
             logger.warning("[StackSTAC] Formula eval failed: %s, using manual computation", e)
             # Fallback: manual computation for known indices
             if index_name == "NDBI" and "B08" in band_arrays and "B11" in band_arrays:
-                nir = band_arrays["B08"].astype(_np_local.float64)
-                swir = band_arrays["B11"].astype(_np_local.float64)
+                nir = band_arrays["B08"].astype(_np_local.float32)
+                swir = band_arrays["B11"].astype(_np_local.float32)
                 denom = nir + swir
                 denom[denom == 0] = _np_local.nan
                 index_array = (swir - nir) / denom
             elif index_name == "NDVI" and "B08" in band_arrays and "B04" in band_arrays:
-                nir = band_arrays["B08"].astype(_np_local.float64)
-                red = band_arrays["B04"].astype(_np_local.float64)
+                nir = band_arrays["B08"].astype(_np_local.float32)
+                red = band_arrays["B04"].astype(_np_local.float32)
                 denom = nir + red
                 denom[denom == 0] = _np_local.nan
                 index_array = (nir - red) / denom
