@@ -9,8 +9,20 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import HOST, PORT, STAC_API_URL
-from app.routes import analysis, change, decision, evidence, explain, flood, health, index, preprocess, providers, provenance, query, semantic, sensor, stac, timeseries, temporal_compare
-from app.services.eo_provider import init_default_provider, register_provider, CopernicusProvider, BhoonidhiProvider, AWSEarthSearchProvider, NASACMRProvider
+from app.routes import health, temporal_compare, stac, query
+# Defer heavy route imports until first request to save startup memory
+_heavy_routes_loaded = False
+
+def _load_heavy_routes():
+    global _heavy_routes_loaded
+    if _heavy_routes_loaded:
+        return
+    _heavy_routes_loaded = True
+    from app.routes import analysis, change, decision, evidence, explain, flood, index, preprocess, providers, provenance, semantic, sensor, timeseries
+    for r in [analysis, change, decision, evidence, explain, flood, index, preprocess, providers, provenance, semantic, sensor, timeseries]:
+        app.include_router(r.router)
+
+from app.services.eo_provider import init_default_provider, register_provider
 from app.security import RateLimitMiddleware, SecurityHeadersMiddleware, AuditMiddleware, get_cors_origins
 
 # ── Logging ──────────────────────────────────────────────────────
@@ -55,65 +67,47 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# ── Initialize EO Providers ───────────────────────────────────
-
+# ── Initialize EO Providers (minimal at startup) ──────────────
 import os
 
-# 1. Planetary Computer (lowest priority — registered first, overridden by others)
+# Only initialize Planetary Computer at startup (needed for temporal-compare)
 init_default_provider(api_url=STAC_API_URL)
-logger.info("EO Provider initialized: planetary_computer (fallback only)")
+logger.info("EO Provider initialized: planetary_computer")
 
-# 2. Copernicus CDSE (secondary — works without token)
-copernicus_token = os.environ.get("COPERNICUS_TOKEN")
-copernicus_provider = CopernicusProvider(token=copernicus_token)
-register_provider(copernicus_provider, default=False)
-logger.info("EO Provider registered: copernicus_cdse (secondary)")
-
-# 3. Bhoonidhi / ISRO (PRIMARY — registered last to override defaults)
-bhoonidhi_user = os.environ.get("BHOONIDHI_USER")
-bhoonidhi_pass = os.environ.get("BHOONIDHI_PASS")
-if bhoonidhi_user and bhoonidhi_pass:
-    bhoonidhi_provider = BhoonidhiProvider(user_id=bhoonidhi_user, password=bhoonidhi_pass)
-    register_provider(bhoonidhi_provider, default=False)  # Bhoonidhi is secondary (not STAC-compatible)
-    logger.info("EO Provider registered: bhoonidhi (secondary — ISRO data)")
-else:
-    logger.info("Bhoonidhi skipped (set BHOONIDHI_USER + BHOONIDHI_PASS to enable)")
-
-# 4. AWS Earth Search (tertiary — free, no auth, good fallback)
-try:
-    aws_provider = AWSEarthSearchProvider()
-    register_provider(aws_provider, default=False)
-    logger.info("EO Provider registered: aws_earth_search (tertiary — free fallback)")
-except Exception as e:
-    logger.warning("AWS Earth Search registration failed: %s", e)
-
-# 5. NASA CMR (for MODIS/VIIRS/Landsat HLS — fire, snow, vegetation)
-try:
-    nasa_provider = NASACMRProvider()
-    register_provider(nasa_provider, default=False)
-    logger.info("EO Provider registered: nasa_cmr (MODIS/VIIRS fire+snow+vegetation)")
-except Exception as e:
-    logger.warning("NASA CMR registration failed: %s", e)
-
-# ── Routes ───────────────────────────────────────────────────────
-
+# Other providers loaded lazily on first use
+_other_providers_loaded = False
+def _load_other_providers():
+    global _other_providers_loaded
+    if _other_providers_loaded:
+        return
+    _other_providers_loaded = True
+    from app.services.eo_provider import CopernicusProvider, BhoonidhiProvider, AWSEarthSearchProvider, NASACMRProvider
+    copernicus_token = os.environ.get("COPERNICUS_TOKEN")
+    if copernicus_token:
+        register_provider(CopernicusProvider(token=copernicus_token), default=False)
+    bhoonidhi_user = os.environ.get("BHOONIDHI_USER")
+    bhoonidhi_pass = os.environ.get("BHOONIDHI_PASS")
+    if bhoonidhi_user and bhoonidhi_pass:
+        register_provider(BhoonidhiProvider(user_id=bhoonidhi_user, password=bhoonidhi_pass), default=False)
+    try:
+        register_provider(AWSEarthSearchProvider(), default=False)
+    except Exception:
+        pass
+    try:
+        register_provider(NASACMRProvider(), default=False)
+    except Exception:
+        pass# ── Routes (essential only at startup — heavy routes deferred) ─
 app.include_router(health.router)
+app.include_router(temporal_compare.router)  # Main analysis endpoint
 app.include_router(stac.router)
-app.include_router(analysis.router)
-app.include_router(preprocess.router)
-app.include_router(timeseries.router)
-app.include_router(index.router)
-app.include_router(change.router)
-app.include_router(evidence.router)
-app.include_router(explain.router)
-app.include_router(sensor.router)
-app.include_router(flood.router)
 app.include_router(query.router)
-app.include_router(providers.router)
-app.include_router(decision.router)
-app.include_router(provenance.router)
-app.include_router(temporal_compare.router)
-app.include_router(semantic.router)
+
+# Load remaining routes on first non-health request (saves ~50MB startup)
+@app.middleware("http")
+async def load_heavy_routes_middleware(request, call_next):
+    if request.url.path not in ("/health", "/", "/docs", "/redoc"):
+        _load_heavy_routes()
+    return await call_next(request)
 
 
 import os as _os
