@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+
+# ── GDAL memory constraints (must be set BEFORE any GDAL/rasterio import) ──
+os.environ["GDAL_CACHEMAX"] = "32"          # 32MB per band (down from default 256MB)
+os.environ["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"  # Don't scan directory on open
+os.environ["GDAL_HTTP_TIMEOUT"] = "30"
+os.environ["GDAL_HTTP_MAX_RETRY"] = "2"
+os.environ["CPL_VSIL_CURL_ALLOWED_EXTENSIONS"] = "tif,TIF,tiff,TFW"
+# Force GDAL to only read requested windows, not full files
+os.environ["GDAL_BAND_BLOCK_CACHE"] = "HASHSET"
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

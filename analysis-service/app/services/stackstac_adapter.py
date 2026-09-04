@@ -80,9 +80,9 @@ def stackstac_mosaic(
     )
 
     # Build the StackSTAC datacube
-    # chunksize=(1, n_bands, 512, 512) keeps memory usage per-chunk at ~4MB
-    # Use float64 because StackSTAC default fill_value=nan is incompatible with float32
-    stackstac_dtype = "float64" if dtype == "float32" else dtype
+    # chunksize=(1, n_bands, 512, 512) keeps memory usage per-chunk at ~1MB
+    # Use the requested dtype directly — float32 is fine for spectral indices
+    stackstac_dtype = dtype
     try:
         cube = stackstac.stack(
             stac_items,
@@ -93,6 +93,7 @@ def stackstac_mosaic(
             rescale=False,  # Keep raw integer values
             chunksize=(1, len(band_names), 512, 512),
             dtype=stackstac_dtype,
+            fill_value=float("nan"),
         )
     except Exception as e:
         logger.error("[StackSTAC] stack() failed: %s", e)
