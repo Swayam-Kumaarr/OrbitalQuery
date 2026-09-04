@@ -252,7 +252,7 @@ def stackstac_compute_index(
         resolution=resolution,
         epsg=epsg,
         max_dim=max_dim,
-        dtype="float64",
+        dtype="float32",  # float32 saves 50% memory vs float64 — sufficient precision for spectral indices
     )
 
     data = result["data"]  # (n_bands, height, width)

@@ -27,6 +27,7 @@ Architecture:
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1942,6 +1943,9 @@ def run_temporal_comparison(
                         ),
                     })
 
+    # Force GC after index computation to free raster memory before change detection
+    gc.collect()
+
     # 4b: Compute additional indicators for multi-signal analysis
     # Use the SAME mosaic scenes as the primary index for shape consistency.
     if multi_signal_enabled and len(all_indicators) > 1:
@@ -2284,6 +2288,9 @@ def run_temporal_comparison(
                         logger.warning("NDVI reprojection failed: %s — running without NDVI support", e, exc_info=True)
                         ndvi_baseline_aligned = None
                         ndvi_comparison_aligned = None
+
+            # Free memory before change detection (raster arrays from index computation)
+            gc.collect()
 
             # Run change detection through the unified detector interface
             from app.services.detector_interface import detect_change, get_supported_methods
