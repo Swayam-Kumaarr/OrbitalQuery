@@ -81,8 +81,13 @@ def stackstac_mosaic(
 
     # Build the StackSTAC datacube
     # chunksize=(1, n_bands, 512, 512) keeps memory usage per-chunk at ~1MB
-    # Use the requested dtype directly — float32 is fine for spectral indices
-    stackstac_dtype = dtype
+    # Use float32 directly — saves 50% memory vs float64 (critical for Render 512MB limit)
+    #
+    # In StackSTAC, dtype='float32' requires a fill_value of type np.float32 (e.g. np.float32(np.nan))
+    # so that np.can_cast(type(fill_value), dtype) succeeds without raising ValueError.
+    stackstac_dtype = np.float32 if dtype in ("float32", np.float32, np.dtype("float32")) else dtype
+    fill_val = np.float32(np.nan) if stackstac_dtype == np.float32 else np.nan
+
     try:
         cube = stackstac.stack(
             stac_items,
@@ -93,7 +98,7 @@ def stackstac_mosaic(
             rescale=False,  # Keep raw integer values
             chunksize=(1, len(band_names), 512, 512),
             dtype=stackstac_dtype,
-            fill_value=float("nan"),
+            fill_value=fill_val,
         )
     except Exception as e:
         logger.error("[StackSTAC] stack() failed: %s", e)
@@ -101,7 +106,7 @@ def stackstac_mosaic(
 
     # Log cube metadata
     dims = dict(zip(cube.dims, cube.shape))
-    logger.info("[StackSTAC] Cube shape: %s dims: %s", list(cube.shape), dims)
+    logger.info("[StackSTAC] Cube shape: %s dims: %s dtype: %s", list(cube.shape), dims, cube.dtype)
 
     # If max_dim is set and cube is larger, resample to fit
     if max_dim is not None:
@@ -112,7 +117,7 @@ def stackstac_mosaic(
             new_w = int(w * scale)
             logger.info(
                 "[StackSTAC] Resampling from %dx%d to %dx%d (scale=%.2f)",
-                w, h, new_w, new_h, scale,
+                w, h, new_h, new_w, scale,
             )
             cube = cube.coarsen(y=int(h / new_h), x=int(w / new_w)).mean()
             dims = dict(zip(cube.dims, cube.shape))
@@ -155,6 +160,10 @@ def stackstac_mosaic(
         # (time, bands, height, width) — already median'd, should be (bands, height, width)
         if result_array.shape[0] == 1:
             result_array = result_array[0]
+
+    # Ensure float32 dtype
+    if stackstac_dtype == np.float32 and result_array.dtype != np.float32:
+        result_array = result_array.astype(np.float32)
 
     # Extract metadata from the xarray object
     try:
@@ -265,53 +274,32 @@ def stackstac_compute_index(
     for i, phys in enumerate(physical_bands):
         band_arrays[phys] = data[i]
 
-    # Compute the index using the same formulas as spectral_indices.py
-    from app.services.spectral_indices import INDEX_DEFINITIONS
-    index_def = INDEX_DEFINITIONS.get(index_name)
-    if index_def and hasattr(index_def, 'formula'):
-        # Build named band references for the formula
-        # Map physical band names back to formula variables
-        logical_to_physical = band_map  # e.g. {'nir': 'B08', 'swir1': 'B11'}
-        formula_vars = {}
-        for logical, physical in logical_to_physical.items():
-            if physical in band_arrays:
-                formula_vars[logical] = band_arrays[physical]
-                # Also map by uppercase band name (B08, B11, etc.)
-                formula_vars[physical] = band_arrays[physical]
+    # Compute the index using canonical spectral_indices engine
+    from app.services.spectral_indices import INDEX_DEFINITIONS, compute_index
+    index_def = INDEX_DEFINITIONS.get(index_name.upper())
+    if not index_def:
+        raise ValueError(f"Index '{index_name}' not found in INDEX_DEFINITIONS")
 
-        try:
-            # Try direct eval with numpy
-            import numpy as _np_local
-            safe_dict = {**formula_vars, 'np': _np_local, 'numpy': _np_local, 'nan': _np_local.nan}
-            # Also add commonly used band references
-            for k, v in band_arrays.items():
-                safe_dict[k] = v
+    required_logical = index_def.bands_required
+    phys_a = band_map.get(required_logical[0])
+    phys_b = band_map.get(required_logical[1])
 
-            index_array = eval(index_def.formula, {"__builtins__": {}}, safe_dict)
-            logger.info(
-                "[StackSTAC] Index %s computed via formula: shape=%s mean=%.4f",
-                index_name, index_array.shape,
-                float(_np_local.nanmean(index_array)),
-            )
-        except Exception as e:
-            logger.warning("[StackSTAC] Formula eval failed: %s, using manual computation", e)
-            # Fallback: manual computation for known indices
-            if index_name == "NDBI" and "B08" in band_arrays and "B11" in band_arrays:
-                nir = band_arrays["B08"].astype(_np_local.float32)
-                swir = band_arrays["B11"].astype(_np_local.float32)
-                denom = nir + swir
-                denom[denom == 0] = _np_local.nan
-                index_array = (swir - nir) / denom
-            elif index_name == "NDVI" and "B08" in band_arrays and "B04" in band_arrays:
-                nir = band_arrays["B08"].astype(_np_local.float32)
-                red = band_arrays["B04"].astype(_np_local.float32)
-                denom = nir + red
-                denom[denom == 0] = _np_local.nan
-                index_array = (nir - red) / denom
-            else:
-                raise RuntimeError(f"Cannot compute {index_name} with available bands: {list(band_arrays.keys())}")
+    if phys_a and phys_b and phys_a in band_arrays and phys_b in band_arrays:
+        index_array = compute_index(band_arrays[phys_a], band_arrays[phys_b], index_def)
     else:
-        raise RuntimeError(f"Index {index_name} not found in INDEX_DEFINITIONS")
+        # Fallback to available physical bands
+        keys = list(band_arrays.keys())
+        if len(keys) >= 2:
+            index_array = compute_index(band_arrays[keys[0]], band_arrays[keys[1]], index_def)
+        else:
+            raise RuntimeError(f"Cannot compute {index_name} with available bands: {list(band_arrays.keys())}")
+
+    logger.info(
+        "[StackSTAC] Index %s computed: shape=%s mean=%.4f (valid=%d pixels)",
+        index_name, index_array.shape,
+        float(np.nanmean(index_array)),
+        int(np.sum(~np.isnan(index_array) & (index_array != 0))),
+    )
 
     result["data"] = index_array
     result["shape"] = [h, w]

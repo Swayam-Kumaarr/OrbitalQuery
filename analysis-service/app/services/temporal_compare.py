@@ -386,21 +386,24 @@ def _compute_index_from_mosaic_scenes(
         raise ValueError(f"Insufficient band mappings for {index_name}")
 
     # Collect band hrefs from all scenes
-    # For each required band, gather hrefs from each scene
+    # For each required band, gather hrefs from each scene using robust resolution
+    from app.services.stac_service import resolve_band_asset
     band_href_lists: dict[str, list[str]] = {logical: [] for logical in required_bands}
     for scene in scenes:
         assets = scene.get("assets", {})
         for logical_name, physical_name in physical_bands.items():
-            asset = assets.get(physical_name)
             href = ""
-            if asset is None:
-                pass
-            elif hasattr(asset, 'href'):
-                href = getattr(asset, 'href', '') or ''
-            elif isinstance(asset, dict):
-                href = asset.get('href', '') or ''
-            elif isinstance(asset, str):
-                href = asset
+            try:
+                resolved_key, asset = resolve_band_asset(assets, physical_name, collection=sensor)
+                if hasattr(asset, 'href'):
+                    href = getattr(asset, 'href', '') or ''
+                elif isinstance(asset, dict):
+                    href = asset.get('href', '') or ''
+                elif isinstance(asset, str):
+                    href = asset
+            except KeyError as e:
+                logger.debug("[%s] Band '%s' (%s) not found in scene %s: %s", period_label, logical_name, physical_name, scene.get("id", "?"), e)
+
             if href:
                 band_href_lists[logical_name].append(href)
 
@@ -507,15 +510,17 @@ def _compute_index_from_mosaic_scenes(
                 method="stackstac",
             )
     except Exception as e:
-        logger.warning("[%s] StackSTAC failed (%s), falling back to manual mosaic", period_label, e)
+        logger.error("[%s] StackSTAC failed: %s — using bounded manual mosaic fallback", period_label, e, exc_info=True)
 
-    # Fallback: manual mosaic path (rasterio window reads)
+    # Fallback: bounded manual mosaic path (rasterio window reads)
+    # Bound to at most 2 scenes so request finishes well within 55s timeout
+    MAX_FALLBACK_SCENES = 2
     band_arrays = {}
     nodata_masks = {}
 
     for logical_name in required_bands:
         physical_name = physical_bands[logical_name]
-        scene_hrefs = band_href_lists[logical_name]
+        scene_hrefs = band_href_lists[logical_name][:MAX_FALLBACK_SCENES]
 
         if len(scene_hrefs) == 1:
             # Single scene for this band — just read it
@@ -627,21 +632,22 @@ def _compute_index_stats(
         logger.warning("Insufficient band mappings for %s: %s", index_name, physical_bands)
         return _compute_index_stats_fallback(index_name, sensor, scene, bbox)
 
-    # Extract signed asset hrefs from scene
-    # Assets can be: pystac.Asset objects, dicts with 'href' key, or plain strings
+    # Extract signed asset hrefs from scene using robust resolver
+    from app.services.stac_service import resolve_band_asset
     band_hrefs = {}
     for logical_name, physical_name in physical_bands.items():
-        asset = scene.assets.get(physical_name)
         href = ""
-        if asset is None:
-            href = ""
-        elif hasattr(asset, 'href'):
-            # pystac.Asset object — use .href attribute
-            href = getattr(asset, 'href', '') or ''
-        elif isinstance(asset, dict):
-            href = asset.get('href', '') or ''
-        elif isinstance(asset, str):
-            href = asset
+        try:
+            resolved_key, asset = resolve_band_asset(scene.assets, physical_name, collection=sensor)
+            if hasattr(asset, 'href'):
+                href = getattr(asset, 'href', '') or ''
+            elif isinstance(asset, dict):
+                href = asset.get('href', '') or ''
+            elif isinstance(asset, str):
+                href = asset
+        except KeyError as e:
+            logger.debug("Scene %s missing band asset %s: %s", scene.item_id, physical_name, e)
+
         if href:
             band_hrefs[logical_name] = href
 
@@ -2013,13 +2019,19 @@ def run_temporal_comparison(
                     href1 = ""
                     href2 = ""
                     if physical_t1:
-                        asset = selection_t1.scenes[0].assets.get(physical_t1)
-                        if asset:
+                        try:
+                            from app.services.stac_service import resolve_band_asset
+                            _, asset = resolve_band_asset(selection_t1.scenes[0].assets, physical_t1, collection=selection_t1.collection)
                             href1 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
+                        except KeyError:
+                            href1 = ""
                     if physical_t2:
-                        asset = selection_t2.scenes[0].assets.get(physical_t2)
-                        if asset:
+                        try:
+                            from app.services.stac_service import resolve_band_asset
+                            _, asset = resolve_band_asset(selection_t2.scenes[0].assets, physical_t2, collection=selection_t2.collection)
                             href2 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
+                        except KeyError:
+                            href2 = ""
 
                     if href1 and href2:
                         # Determine common analysis grid (use safe_max_dim for memory safety)
@@ -2134,10 +2146,20 @@ def run_temporal_comparison(
             scl_available = False
             if selection_t1.collection == 'sentinel-2-l2a' and selection_t1.scenes:
                 try:
-                    scl_asset_t1 = selection_t1.scenes[0].assets.get('SCL')
-                    scl_asset_t2 = selection_t2.scenes[0].assets.get('SCL') if selection_t2.scenes else None
-                    scl_href1 = scl_asset_t1.get('href', '') if isinstance(scl_asset_t1, dict) else ''
-                    scl_href2 = scl_asset_t2.get('href', '') if isinstance(scl_asset_t2, dict) else ''
+                    from app.services.stac_service import resolve_band_asset
+                    scl_href1 = ""
+                    scl_href2 = ""
+                    try:
+                        _, scl_asset_t1 = resolve_band_asset(selection_t1.scenes[0].assets, 'SCL', collection='sentinel-2-l2a')
+                        scl_href1 = scl_asset_t1.get('href', '') if isinstance(scl_asset_t1, dict) else getattr(scl_asset_t1, 'href', '') or ''
+                    except KeyError:
+                        pass
+                    if selection_t2.scenes:
+                        try:
+                            _, scl_asset_t2 = resolve_band_asset(selection_t2.scenes[0].assets, 'SCL', collection='sentinel-2-l2a')
+                            scl_href2 = scl_asset_t2.get('href', '') if isinstance(scl_asset_t2, dict) else getattr(scl_asset_t2, 'href', '') or ''
+                        except KeyError:
+                            pass
                     if scl_href1 and scl_href2:
                         from app.services.raster_service import read_raster_window, reproject_to_grid
                         from app.services.compositor import create_cloud_mask
@@ -2246,13 +2268,17 @@ def run_temporal_comparison(
                                 ndvi_href1 = ""
                                 ndvi_href2 = ""
                                 if ndvi_physical_t1:
-                                    asset = selection_t1.scenes[0].assets.get(ndvi_physical_t1)
-                                    if asset:
+                                    try:
+                                        _, asset = resolve_band_asset(selection_t1.scenes[0].assets, ndvi_physical_t1, collection=selection_t1.collection)
                                         ndvi_href1 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
+                                    except KeyError:
+                                        ndvi_href1 = ""
                                 if ndvi_physical_t2:
-                                    asset = selection_t2.scenes[0].assets.get(ndvi_physical_t2)
-                                    if asset:
+                                    try:
+                                        _, asset = resolve_band_asset(selection_t2.scenes[0].assets, ndvi_physical_t2, collection=selection_t2.collection)
                                         ndvi_href2 = asset.get("href", "") if isinstance(asset, dict) else getattr(asset, "href", "") or ""
+                                    except KeyError:
+                                        ndvi_href2 = ""
 
                                 if ndvi_href1 and ndvi_href2:
                                     with rasterio.Env(GDAL_CACHEMAX=64, GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", GDAL_HTTP_TIMEOUT="30"):

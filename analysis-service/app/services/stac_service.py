@@ -131,6 +131,109 @@ def select_best_asset(
     raise ValueError("No assets found in STAC item")
 
 
+def resolve_band_asset(
+    assets: dict[str, Any],
+    band_name: str,
+    collection: Optional[str] = None,
+) -> tuple[str, Any]:
+    """
+    Resolve a logical or physical band name to its corresponding STAC asset.
+
+    Resolution strategy:
+    1. Exact key match (e.g. "B04", "B08", "B11", "SCL", "QA_PIXEL")
+    2. Case-insensitive key match (e.g. "b04" -> "B04", "scl" -> "SCL")
+    3. STAC eo:bands metadata matching (by 'name' or 'common_name')
+    4. Canonical band alias matching (e.g. "red" -> "B04", "nir" -> "B08" for Sentinel-2)
+    5. Asset title / description matching (e.g. "Band 4 - Red")
+
+    Raises KeyError if the band cannot be resolved. NEVER silently defaults to another band.
+
+    Returns:
+        tuple of (resolved_asset_key, asset_dict_or_object)
+    """
+    if not assets:
+        raise KeyError(
+            f"Cannot resolve band '{band_name}': STAC item contains no assets. "
+            f"Collection: '{collection or 'unknown'}'"
+        )
+
+    # 1. Exact key match
+    if band_name in assets:
+        return band_name, assets[band_name]
+
+    # 2. Case-insensitive key match
+    band_name_upper = band_name.strip().upper()
+    for key, asset in assets.items():
+        if key.strip().upper() == band_name_upper:
+            return key, asset
+
+    # 3. STAC eo:bands metadata matching
+    band_name_lower = band_name.strip().lower()
+    for key, asset in assets.items():
+        eo_bands = []
+        if isinstance(asset, dict):
+            eo_bands = asset.get("eo:bands") or asset.get("extra_fields", {}).get("eo:bands", [])
+        elif hasattr(asset, "extra_fields"):
+            eo_bands = asset.extra_fields.get("eo:bands", [])
+        for b_meta in eo_bands:
+            if isinstance(b_meta, dict):
+                c_name = str(b_meta.get("common_name", "")).strip().lower()
+                n_name = str(b_meta.get("name", "")).strip().upper()
+                if c_name == band_name_lower or n_name == band_name_upper:
+                    return key, asset
+
+    # 4. Known canonical aliases for Sentinel-2 / Landsat
+    S2_ALIASES = {
+        "RED": "B04", "NIR": "B08", "SWIR": "B11", "SWIR1": "B11", "SWIR16": "B11",
+        "SWIR2": "B12", "SWIR22": "B12", "GREEN": "B03", "BLUE": "B02",
+        "COASTAL": "B01", "REDEDGE1": "B05", "REDEDGE2": "B06", "REDEDGE3": "B07",
+        "NIR08": "B8A", "NARROW_NIR": "B8A", "WVP": "B09", "WATER_VAPOUR": "B09",
+        "SCL": "SCL", "SCENE_CLASSIFICATION": "SCL", "AOT": "AOT",
+    }
+    LANDSAT_ALIASES = {
+        "RED": "B4", "NIR": "B5", "SWIR": "B6", "SWIR1": "B6", "SWIR16": "B6",
+        "SWIR2": "B7", "SWIR22": "B7", "GREEN": "B3", "BLUE": "B2",
+        "COASTAL": "B1", "QA": "QA_PIXEL", "QA_PIXEL": "QA_PIXEL",
+    }
+
+    target_alias = None
+    if collection and "landsat" in collection.lower():
+        target_alias = LANDSAT_ALIASES.get(band_name_upper)
+    else:
+        # Default to Sentinel-2 or check both
+        target_alias = S2_ALIASES.get(band_name_upper) or LANDSAT_ALIASES.get(band_name_upper)
+
+    if target_alias:
+        if target_alias in assets:
+            return target_alias, assets[target_alias]
+        for key, asset in assets.items():
+            if key.strip().upper() == target_alias.upper():
+                return key, asset
+
+    # 5. Asset title / description matching
+    for key, asset in assets.items():
+        title = ""
+        desc = ""
+        if isinstance(asset, dict):
+            title = str(asset.get("title", ""))
+            desc = str(asset.get("description", ""))
+        elif hasattr(asset, "title"):
+            title = str(getattr(asset, "title", "") or "")
+            desc = str(getattr(asset, "description", "") or "")
+
+        combined = f"{title} {desc}".upper()
+        if band_name_upper in combined:
+            return key, asset
+
+    # Failed to resolve — raise explicit error with full diagnostics
+    available_keys = list(assets.keys())
+    raise KeyError(
+        f"Could not resolve STAC asset for requested band '{band_name}'. "
+        f"Collection: '{collection or 'unknown'}'. "
+        f"Available asset keys: {available_keys}"
+    )
+
+
 def get_asset_href(asset: dict[str, Any]) -> str:
     """Get the href from a STAC asset, preferring signed href."""
     provider = get_default_provider()

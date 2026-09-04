@@ -398,6 +398,7 @@ def select_scenes_for_period(
     covered_bboxes: list[list[float]] = []
     warnings: list[str] = []
 
+    prev_coverage = 0.0
     for scene, score, overlap in scored:
         if len(selected) >= MAX_SCENES_PER_PERIOD:
             warnings.append(
@@ -406,15 +407,24 @@ def select_scenes_for_period(
             )
             break
 
-        selected.append((scene, score, overlap))
         scene_bbox = scene.get("bbox", [])
         if scene_bbox and len(scene_bbox) == 4:
-            covered_bboxes.append(scene_bbox)
+            test_bboxes = covered_bboxes + [scene_bbox]
+            new_coverage = _estimate_collective_coverage(aoi_bbox, test_bboxes)
+            marginal_gain = new_coverage - prev_coverage
 
-        # Check current coverage
-        current_coverage = _estimate_collective_coverage(aoi_bbox, covered_bboxes)
-        if current_coverage >= TARGET_COVERAGE_RATIO:
-            break
+            # Avoid adding duplicate observations from different dates that cover the exact same footprint
+            if len(selected) >= 1 and marginal_gain < 0.03:
+                continue
+
+            selected.append((scene, score, overlap))
+            covered_bboxes.append(scene_bbox)
+            prev_coverage = new_coverage
+
+            if new_coverage >= TARGET_COVERAGE_RATIO:
+                break
+        else:
+            selected.append((scene, score, overlap))
 
     # Step 4: Sensor consistency check
     selected_dicts = [s[0] for s in selected]

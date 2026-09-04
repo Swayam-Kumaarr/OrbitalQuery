@@ -556,14 +556,10 @@ def validate_analysis_plan(
 
     # Check if each required logical band is covered
     for req in required_logical:
-        # Direct match (user passed logical name)
+        # Direct match (user passed logical name like NIR, SWIR)
         if req in provided:
             continue
-        # Physical match — check if any physical band maps to this logical band
-        # Use prefix matching: 'SWIR' matches 'SWIR1', 'SWIR2' etc.
-        if any(v == req or v.startswith(req) for v in physical_to_logical.values()):
-            continue
-        # Check if any provided band maps to this logical band
+        # Check if any provided physical band maps to this logical band
         # Use prefix matching: 'SWIR' matches 'SWIR1', 'SWIR2' etc.
         found = False
         for p in provided:

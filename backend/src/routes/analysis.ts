@@ -1298,7 +1298,7 @@ router.post('/temporal-compare', optionalAuth, async (req: AuthRequest, res: Res
   if (cloud_threshold !== undefined) pythonBody.cloud_threshold = cloud_threshold;
 
   const { callPythonService } = await import('../services/python-client');
-  const PYTHON_TIMEOUT = 55000; // 55s per attempt — Python analysis takes ~49s on Render free tier. With 1 retry + 25s cold-start wait = 135s worst case (frontend retries once on timeout)
+  const PYTHON_TIMEOUT = 180000; // 180s — verified Python pipeline needs ~120-200s for real EO analysis
   
   // Call Python directly (no health pre-check — it adds latency and
   // incorrectly skips Python during cold starts)
@@ -1335,203 +1335,21 @@ router.post('/temporal-compare', optionalAuth, async (req: AuthRequest, res: Res
     return;
   }
 
-  console.log(`[temporal-compare] Python returned error (${result.code}), using local fallback`);
+  console.log(`[temporal-compare] Python returned error (${result.code})`);
 
-  // ── LOCAL FALLBACK when Python is down ─────────────────────
-  // Generate a plan from the query text + search SQLite for matching datasets
-  console.log('[temporal-compare] Python unavailable, using local fallback');
-
-  try {
-    const { SemanticSearchEngine } = await import('../services/search-engine');
-    const { prisma } = await import('../index');
-
-    const searchEngine = new SemanticSearchEngine();
-
-    // Parse query to extract location info
-    const q = query.toLowerCase();
-    const locations: Record<string, number[]> = {
-      // Major Indian cities
-      'mumbai': [72.75, 18.85, 73.05, 19.15], 'delhi': [77.0, 28.4, 77.4, 28.75],
-      'new delhi': [77.0, 28.4, 77.4, 28.75], 'jaipur': [75.7, 26.8, 75.95, 27.05],
-      'bangalore': [77.4, 12.85, 77.75, 13.1], 'bengaluru': [77.4, 12.85, 77.75, 13.1],
-      'chennai': [80.05, 12.9, 80.35, 13.15], 'kolkata': [88.25, 22.45, 88.45, 22.65],
-      'hyderabad': [78.3, 17.3, 78.6, 17.55], 'ahmedabad': [72.5, 22.95, 72.75, 23.15],
-      'pune': [73.75, 18.45, 74.0, 18.65], 'lucknow': [80.85, 26.75, 81.1, 26.95],
-      'bhopal': [77.35, 23.2, 77.55, 23.4], 'patna': [85.05, 25.55, 85.25, 25.7],
-      'guwahati': [91.65, 26.1, 91.8, 26.25], 'nagpur': [79.0, 21.0, 79.2, 21.2],
-      'indore': [75.7, 22.6, 76.0, 22.85], 'coimbatore': [76.8, 10.9, 77.1, 11.15],
-      'visakhapatnam': [83.1, 17.6, 83.4, 17.85], 'dehradun': [77.9, 30.2, 78.2, 30.45],
-      'shimla': [77.05, 31.05, 77.25, 31.2], 'gangtok': [88.55, 27.3, 88.7, 27.45],
-      // Indian states/regions
-      'assam': [89.5, 24.0, 96.0, 28.0], 'himalaya': [77.0, 28.0, 80.0, 35.0],
-      'himalayas': [77.0, 28.0, 80.0, 35.0], 'thar desert': [69.0, 24.0, 74.0, 28.0],
-      'sundarbans': [88.5, 21.6, 89.2, 22.1], 'kashmir': [73.5, 33.0, 77.5, 36.5],
-      'kerala': [74.8, 8.0, 77.5, 12.8], 'rajasthan': [69.5, 23.0, 76.5, 30.5],
-      'uttarakhand': [77.5, 28.5, 81.0, 31.5], 'karnataka': [74.0, 11.5, 78.5, 18.5],
-      'tamil nadu': [76.0, 7.5, 80.5, 13.5], 'odisha': [81.0, 17.5, 87.5, 22.5],
-      'madhya pradesh': [74.0, 21.0, 82.5, 26.5], 'maharashtra': [72.5, 15.5, 80.5, 22.0],
-      'andhra pradesh': [77.0, 12.5, 84.5, 19.5],
-      // International
-      'amazon': [-75.0, -15.0, -45.0, 5.0], 'tokyo': [139.5, 35.4, 140.0, 35.9],
-      'london': [-0.5, 51.3, 0.3, 51.7], 'cairo': [31.0, 29.8, 31.5, 30.2],
-      'sydney': [150.5, -34.2, 151.5, -33.6], 'new york': [-74.1, 40.6, -73.7, 40.9],
-      'california': [-124.5, 32.5, -114.0, 42.0], 'los angeles': [-118.7, 33.7, -117.9, 34.35],
-      'rio de janeiro': [-43.5, -23.1, -43.0, -22.7], 'dhaka': [90.3, 23.6, 90.5, 23.9],
-      'kathmandu': [85.2, 27.6, 85.5, 27.8], 'jakarta': [106.7, -6.3, 107.0, -6.1],
-      'bangkok': [100.4, 13.6, 100.8, 13.95], 'beijing': [116.2, 39.7, 116.7, 40.05],
-    };
-    let fallbackBbox = bbox;
-    let aoiName = aoi || 'Unknown';
-    if (!fallbackBbox) {
-      for (const [loc, lbbox] of Object.entries(locations)) {
-        if (q.includes(loc)) { fallbackBbox = lbbox; aoiName = loc.charAt(0).toUpperCase() + loc.slice(1); break; }
-      }
-    }
-    if (!fallbackBbox) fallbackBbox = [68.0, 6.0, 97.5, 37.5];
-
-    // Determine phenomenon from query
-    const phenomena: Record<string, string[]> = {
-      'urban_expansion': ['urban', 'urbanization', 'expansion', 'city growth', 'built-up', 'built up', 'construction', 'infrastructure'],
-      'vegetation_change': ['vegetation', 'greenery', 'ndvi', 'greenness', 'foliage', 'plant'],
-      'deforestation': ['deforest', 'forest loss', 'tree loss', 'logging', 'clearing'],
-      'flood_impact': ['flood', 'flooding', 'inundat', 'deluge', 'monsoon', 'cyclone', 'tsunami', 'storm surge'],
-      'water_change': ['water', 'lake', 'river', 'reservoir', 'water body', 'shoreline'],
-      'burn_severity': ['fire', 'burn', 'wildfire', 'blaze', 'smoke'],
-      'glacier_retreat': ['glacier', 'ice melt', 'snow melt', 'cryosphere', 'permafrost'],
-      'coastal_erosion': ['erosion', 'coastal', 'shoreline', 'beach', 'sea level', 'coast'],
-      'snow_cover': ['snow', 'snowfall', 'ice cover', 'snowline'],
-      'soil_moisture': ['soil', 'drought', 'moisture', 'dry', 'aridity'],
-      'land_cover_change': ['land cover', 'land use', 'lulc', 'land type'],
-    };
-    let detectedPhenomenon = 'land_cover_change';
-    for (const [phenomenon, keywords] of Object.entries(phenomena)) {
-      if (keywords.some(k => q.includes(k))) { detectedPhenomenon = phenomenon; break; }
-    }
-
-    // Determine dates — try overrides first, then parse from query text
-    let fallbackStart = start_date;
-    let fallbackEnd = end_date;
-    if (!fallbackStart || !fallbackEnd) {
-      // Extract years from query: "Sundarbans deforestation 2019 vs 2024" → [2019, 2024]
-      const yearMatches = q.match(/\b(19|20)\d{2}\b/g);
-      if (yearMatches && yearMatches.length >= 2) {
-        const years = yearMatches.map(Number).sort((a, b) => a - b);
-        fallbackStart = fallbackStart || `${years[0]}-01-01`;
-        fallbackEnd = fallbackEnd || `${years[years.length - 1]}-12-31`;
-      } else if (yearMatches && yearMatches.length === 1) {
-        const y = yearMatches[0];
-        fallbackStart = fallbackStart || `${y}-01-01`;
-        fallbackEnd = fallbackEnd || `${y}-12-31`;
-      }
-    }
-    const defaultStart = fallbackStart || '2023-01-01';
-    const defaultEnd = fallbackEnd || new Date().toISOString().split('T')[0];
-
-    // Search SQLite for matching datasets
-    const allDatasets = await prisma.eODataset.findMany({ take: 500 });
-    const parsed = allDatasets.map((d: any) => ({
-      ...d,
-      geometry: d.geometry ? JSON.parse(d.geometry) : null,
-      bbox: d.bbox ? JSON.parse(d.bbox) : null,
-    }));
-    const searchResults = await searchEngine.search(query, parsed, 10);
-
-    // Build a plan
-    const plan = {
-      plan_id: `local-${Date.now()}`,
-      phenomenon: detectedPhenomenon,
-      phenomenon_description: `Analyzing ${detectedPhenomenon} in ${aoiName}`,
-      analysis_type: analysis_type || 'temporal-comparison',
-      sensor: sensor || 'sentinel-2-l2a',
-      bands: ['B04', 'B03', 'B02', 'B08'],
-      aoi: aoiName,
-      bbox: fallbackBbox,
-      start_date: defaultStart,
-      end_date: defaultEnd,
-      cloud_threshold: cloud_threshold || 30,
-      comparison_strategy: 'before-after',
-      min_scenes: 2,
-      max_scenes: 4,
-      output_requirements: ['metrics', 'imagery', 'methodology'],
-      required_indices: detectedPhenomenon === 'flood' ? ['NDWI', 'MNDWI'] : detectedPhenomenon === 'urban_expansion' ? ['NDBI'] : detectedPhenomenon === 'burn_severity' ? ['NBR'] : detectedPhenomenon === 'snow_cover' || detectedPhenomenon === 'glacier_retreat' ? ['NDSI'] : ['NDVI', 'NDWI'],
-      validation: {
-        status: 'local-fallback',
-        phenomenon: detectedPhenomenon,
-        analysis_type: analysis_type || 'temporal-comparison',
-        sensor: sensor || 'sentinel-2-l2a',
-        bands: ['B04', 'B03', 'B02', 'B08'],
-        dates_provided: !!(start_date || end_date),
-        bbox_provided: !!bbox,
-      },
-    };
-
-    // Build scenes from search results
-    const scenes = searchResults.map((r: any) => ({
-      item_id: r.stacId || r.id,
-      collection: r.collection || 'sentinel-2-l2a',
-      datetime: r.startDate || defaultStart,
-      cloud_cover: r.cloudCover ?? null,
-      bbox: r.bbox || fallbackBbox,
-      provider: r.provider || 'local',
-      platform: r.platform || 'Sentinel-2',
-    }));
-
-    // Build a meaningful result
-    const result = {
-      plan_id: plan.plan_id,
-      phenomenon: plan.phenomenon,
-      analysis_type: plan.analysis_type,
-      aoi_name: plan.aoi,
-      aoi_bbox: plan.bbox,
-      period1: { start: defaultStart, end: defaultEnd },
-      period2: { start: defaultStart, end: defaultEnd },
-      scene_t1: scenes[0] || null,
-      scene_t2: scenes[1] || null,
-      index_t1: null,
-      index_t2: null,
-      change_detection: null,
-      metrics: {
-        totalDatasets: searchResults.length,
-        matchedQuery: query,
-        fallbackMode: true,
-      },
-      imagery: { period1: {}, period2: {} },
-      processing_steps: [
-        { step: 'Query parsing', detail: `Detected phenomenon: ${detectedPhenomenon}` },
-        { step: 'Dataset search', detail: `Found ${searchResults.length} matching datasets in local database` },
-        { step: 'Note', detail: 'Full analysis requires the Python analysis engine. Showing dataset matches from local database.' },
-      ],
-      sensor_info: { name: plan.sensor, resolution: '10m' },
-      explanation: {
-        title: `${detectedPhenomenon.charAt(0).toUpperCase() + detectedPhenomenon.slice(1)} Analysis — ${aoiName}`,
-        summary: `Found ${searchResults.length} datasets matching your query. The full temporal comparison analysis requires the Python analysis engine which is currently unavailable. Showing matched datasets from the local database.`,
-        methodology: 'TF-IDF semantic search against local dataset catalog. Full analysis (spectral indices, change detection) requires the Python service.',
-        key_findings: searchResults.slice(0, 3).map((r: any) => `${r.title} (${r.provider || 'Unknown'})`),
-        key_indices: plan.required_indices,
-        sensors_used: [plan.sensor],
-        confidence: 'Local database match only — not a full EO analysis',
-        limitations: ['Python analysis engine unavailable — no raster processing performed', 'Results are database matches, not computed analysis', 'For full analysis, try again when the analysis engine is online'],
-      },
-    };
-
-    res.json({
-      requestId: result.plan_id,
-      status: 'partial',
-      plan,
-      result,
-      fallback: true,
-      message: 'Analysis engine is currently unavailable. Showing dataset matches from local database.',
-      latencyMs: 0,
-    });
-  } catch (fallbackErr: any) {
-    console.error('[temporal-compare] Local fallback also failed:', fallbackErr.message);
-    res.status(502).json({
-      error: 'Analysis engine is currently unavailable',
-      code: 'PYTHON_UNAVAILABLE',
-      requestId: undefined,
-      message: 'The analysis engine is starting up. Please try again in 30-60 seconds.',
-    });
-  }
+  // Temporal analysis has no safe local fallback.
+  // Returning partial/local results would misrepresent the outcome.
+  res.status(200).json({
+    requestId: result.requestId,
+    status: 'error',
+    plan: null,
+    result: null,
+    error: result.error || 'Python analysis service returned an error',
+    code: result.code,
+    message: 'Temporal analysis could not be completed. The EO analysis engine did not return a valid result.',
+    latencyMs: result.upstreamLatencyMs,
+  });
+  return;
 });
 
 // ── POST /api/analysis/yearly-comparison ─────────────────────────

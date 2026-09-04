@@ -179,8 +179,8 @@ export interface AnalysisState {
 
 // ── Constants ───────────────────────────────────────────────────
 
-/** 120s timeout — Vercel rewrite + Render cold start (40s) + retry (2s) + analysis (40s) + overhead */
-const FETCH_TIMEOUT_MS = 120_000;
+/** 240s timeout — Render Python analysis (~120-200s) + Express proxy + Vercel rewrite + overhead */
+const FETCH_TIMEOUT_MS = 240_000;
 
 // ── Helper: single fetch attempt ────────────────────────────────
 
@@ -384,7 +384,7 @@ export function useAnalysis() {
       }));
 
       if (data.fallback) {
-        console.warn('[OrbitalQuery] Running in degraded mode — Python analysis engine unavailable.');
+        console.warn('[OrbitalQuery] Analysis engine unavailable — no local fallback substituted.');
       }
 
     } catch (err: any) {
@@ -400,7 +400,7 @@ export function useAnalysis() {
           'Could not reach the analysis server. Please try again.';
       } else if (code === 'PYTHON_UNAVAILABLE' || code === 'HTTP_503') {
         errorMessage =
-          'The analysis engine is currently unavailable. Showing results from local dataset catalog.';
+          'The EO analysis engine is currently unavailable. Please try again in a few minutes.';
       }
 
       setState(prev => ({

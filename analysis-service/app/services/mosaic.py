@@ -240,9 +240,18 @@ def _resolve_band_index(src: Any, band_name: str) -> int:
     """
     Resolve a band name to a rasterio band index.
 
-    Tries exact match on description, then falls back to numeric index.
+    1. If the raster has only 1 band (e.g. single-band STAC COG asset like B04.tif, B08.tif),
+       returns 1.
+    2. If multi-band (src.count > 1):
+       - Tries exact match on band descriptions
+       - Tries numeric index (1-based) within src.count
+       - Tries common sensor band mappings (S2_MAP, L8_MAP) within src.count
+       - If unresolvable, raises ValueError with full diagnostic info. NEVER silently defaults to band 1.
     """
-    # Try to find by description
+    if src.count == 1:
+        return 1
+
+    # Multi-band raster: try description match
     for i in range(1, src.count + 1):
         desc = src.descriptions[i - 1] if src.descriptions else None
         if desc and band_name.upper() in desc.upper():
@@ -254,15 +263,31 @@ def _resolve_band_index(src: Any, band_name: str) -> int:
         if 1 <= idx <= src.count:
             return idx
 
-    # Try common mappings
+    # Try common mappings for Sentinel-2
     S2_MAP = {"B01": 1, "B02": 2, "B03": 3, "B04": 4, "B05": 5,
-              "B06": 6, "B07": 7, "B08": 8, "B8A": 9, "B11": 11, "B12": 12}
-    if band_name in S2_MAP and S2_MAP[band_name] <= src.count:
-        return S2_MAP[band_name]
+              "B06": 6, "B07": 7, "B08": 8, "B8A": 9, "B09": 9, "B11": 11, "B12": 12}
+    if band_name.upper() in S2_MAP and S2_MAP[band_name.upper()] <= src.count:
+        return S2_MAP[band_name.upper()]
 
-    # Default to first band
-    logger.warning("Could not resolve band '%s', defaulting to band 1", band_name)
-    return 1
+    # Landsat common bands mapping
+    L8_MAP = {"B1": 1, "B2": 2, "B3": 3, "B4": 4, "B5": 5, "B6": 6, "B7": 7,
+              "SR_B1": 1, "SR_B2": 2, "SR_B3": 3, "SR_B4": 4, "SR_B5": 5,
+              "SR_B6": 6, "SR_B7": 7, "SR_B8": 8, "SR_B9": 9}
+    if band_name.upper() in L8_MAP and L8_MAP[band_name.upper()] <= src.count:
+        return L8_MAP[band_name.upper()]
+
+    # Build available band descriptions for the error message
+    available = []
+    for i in range(1, src.count + 1):
+        desc = src.descriptions[i - 1] if src.descriptions else None
+        available.append(f"band {i}: {desc or 'no description'}")
+    available_str = "; ".join(available)
+
+    raise ValueError(
+        f"Cannot resolve band '{band_name}' in multi-band raster with {src.count} bands. "
+        f"Available bands: [{available_str}]. "
+        f"Check STAC asset keys and band mapping."
+    )
 
 
 def _compute_window(

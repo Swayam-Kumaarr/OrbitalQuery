@@ -434,3 +434,133 @@ class TestRegistry:
 
     def test_known_locations_count(self):
         assert len(KNOWN_LOCATIONS) >= 20
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 8: Sensor normalization and band mapping regression
+# ═══════════════════════════════════════════════════════════════
+
+class TestSensorNormalization:
+    """Regression tests for platform-level sensor name normalization."""
+
+    def test_delhi_urban_with_sentinel2_override_passes(self):
+        """Production request: sensor='sentinel-2' must normalize to sentinel-2-l2a."""
+        result = build_analysis_plan(
+            "Delhi urban sprawl 2019 vs 2025",
+            overrides={
+                "phenomenon": "urban_expansion",
+                "sensor": "sentinel-2",
+                "analysis_type": "ndbi_change",
+                "bbox": [77.0, 28.4, 77.4, 28.8],
+                "start_date": "2019-01-01",
+                "end_date": "2025-12-31",
+                "bands": ["B08", "B11"],
+            },
+        )
+        assert result["status"] == "ok", f"Errors: {result.get('errors') or result.get('message')}"
+        plan = result["plan"]
+        assert plan["sensor"] == "sentinel-2-l2a"
+        assert plan["phenomenon"] == "urban_expansion"
+        assert plan["analysis_type"] == "ndbi_change"
+
+    def test_sentinel2_l2a_sensor_still_passes(self):
+        """Canonical collection sensor name must still work."""
+        result = build_analysis_plan(
+            "Delhi urban sprawl 2019 vs 2025",
+            overrides={
+                "phenomenon": "urban_expansion",
+                "sensor": "sentinel-2-l2a",
+                "analysis_type": "ndbi_change",
+                "bbox": [77.0, 28.4, 77.4, 28.8],
+                "start_date": "2019-01-01",
+                "end_date": "2025-12-31",
+                "bands": ["B08", "B11"],
+            },
+        )
+        assert result["status"] == "ok", f"Errors: {result.get('errors') or result.get('message')}"
+        plan = result["plan"]
+        assert plan["sensor"] == "sentinel-2-l2a"
+
+    def test_nir_b08_swir_b11_mapping(self):
+        """Logical NIR/SWIR must map to B08/B11 for Sentinel-2."""
+        result = build_analysis_plan(
+            "Delhi urban sprawl 2019 vs 2025",
+            overrides={
+                "phenomenon": "urban_expansion",
+                "sensor": "sentinel-2",
+                "analysis_type": "ndbi_change",
+                "bbox": [77.0, 28.4, 77.4, 28.8],
+                "start_date": "2019-01-01",
+                "end_date": "2025-12-31",
+            },
+        )
+        assert result["status"] == "ok"
+        plan = result["plan"]
+        bands = plan["bands"]
+        assert "B08" in bands, f"Expected B08 in bands, got {bands}"
+        assert "B11" in bands, f"Expected B11 in bands, got {bands}"
+
+    def test_missing_nir_fails_clearly(self):
+        """Missing NIR must produce a clear validation error."""
+        result = build_analysis_plan(
+            "Delhi urban sprawl 2019 vs 2025",
+            overrides={
+                "phenomenon": "urban_expansion",
+                "sensor": "sentinel-2-l2a",
+                "analysis_type": "ndbi_change",
+                "bbox": [77.0, 28.4, 77.4, 28.8],
+                "start_date": "2019-01-01",
+                "end_date": "2025-12-31",
+                "bands": ["B11"],
+            },
+        )
+        assert result["status"] == "error"
+        errors = result.get("errors", [])
+        assert any("NIR" in e for e in errors), f"Expected NIR error, got {errors}"
+
+    def test_missing_swir_fails_clearly(self):
+        """Missing SWIR must produce a clear validation error."""
+        result = build_analysis_plan(
+            "Delhi urban sprawl 2019 vs 2025",
+            overrides={
+                "phenomenon": "urban_expansion",
+                "sensor": "sentinel-2-l2a",
+                "analysis_type": "ndbi_change",
+                "bbox": [77.0, 28.4, 77.4, 28.8],
+                "start_date": "2019-01-01",
+                "end_date": "2025-12-31",
+                "bands": ["B08"],
+            },
+        )
+        assert result["status"] == "error"
+        errors = result.get("errors", [])
+        assert any("SWIR" in e for e in errors), f"Expected SWIR error, got {errors}"
+
+    def test_unsupported_sensor_fails_clearly(self):
+        """Unsupported sensor must produce a clear validation error."""
+        result = build_analysis_plan(
+            "Delhi urban sprawl 2019 vs 2025",
+            overrides={
+                "phenomenon": "urban_expansion",
+                "sensor": "unknown-sensor",
+                "analysis_type": "ndbi_change",
+                "bbox": [77.0, 28.4, 77.4, 28.8],
+                "start_date": "2019-01-01",
+                "end_date": "2025-12-31",
+                "bands": ["B08", "B11"],
+            },
+        )
+        assert result["status"] == "error"
+        errors = result.get("errors", [])
+        assert any("sensor" in e.lower() or "Sensor" in e for e in errors), f"Expected sensor error, got {errors}"
+
+    def test_nl_query_delhi_urban_produces_valid_plan(self):
+        """The exact natural-language query must produce a valid plan."""
+        result = build_analysis_plan("Delhi urban sprawl 2019 vs 2025")
+        assert result["status"] == "ok", f"Errors: {result.get('errors') or result.get('message')}"
+        plan = result["plan"]
+        assert plan["phenomenon"] == "urban_expansion"
+        assert plan["analysis_type"] == "ndbi_change"
+        assert plan["sensor"] == "sentinel-2-l2a"
+        assert plan["start_date"] == "2019-01-01"
+        assert plan["end_date"] == "2025-12-31"

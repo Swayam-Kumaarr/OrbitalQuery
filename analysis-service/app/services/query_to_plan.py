@@ -672,6 +672,17 @@ def build_analysis_plan(query: str, overrides: Optional[dict[str, Any]] = None) 
 
     # 4. Select sensor and analysis type
     sensor = overrides.get("sensor") or select_sensor(phenomenon)
+
+    # Normalize platform-level sensor names to collection-level names.
+    # Users/natural language may say "sentinel-2", but the capability registry,
+    # INDEX_BAND_MAP, and STAC collections use "sentinel-2-l2a".
+    _SENSOR_ALIAS_MAP = {
+        "sentinel-2": "sentinel-2-l2a",
+        "sentinel-1": "sentinel-1-grd",
+        "landsat": "landsat-c2-l2",
+    }
+    sensor = _SENSOR_ALIAS_MAP.get(sensor, sensor)
+
     analysis_type = overrides.get("analysis_type") or select_analysis_type(phenomenon)
     bands = overrides.get("bands") or select_bands(phenomenon, sensor)
 
