@@ -35,10 +35,6 @@ export default function AnalysisErrorScreen({
     `Query     : ${query || '(none)'}`,
     ``,
     error,
-    ``,
-    `Trace:`,
-    `  Failed to fetch satellite imagery from provider endpoint.`,
-    `  Bounding box coordinates returned 0 matching granules.`,
   ].join('\n');
 
   const copy = async () => {
